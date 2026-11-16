@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Accepted snapshots preserve every byte, including final spaces and newlines.
+test/snapshots/*.accepted -text -whitespace

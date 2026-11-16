@@ -1,0 +1,298 @@
+//// Every token deserves a proper name, even `!=`.
+////
+//// Class names for tokens, derived from their source text.
+////
+//// Words become PascalCase, and an underscore between words joins them
+//// (`else_if` becomes `ElseIf`). Symbols are spelled out (`==` becomes
+//// `EqualEqual`, `#(` becomes `HashLeftParen`), and so is an underscore
+//// anywhere else (`_` becomes `Underscore`).
+//// Any derived name can be replaced under `[tokens.names]`.
+////
+//// Pooka reserves some names: `True` and `False` are words of the
+//// language, and `Int`, `Nil` and the other built-in types cannot be
+//// declared again. A derived name that would clash gets its section added:
+//// the literal `true` becomes `TrueLiteral`.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module name
+
+import pooka/list
+import pooka/string
+
+/// Names a generated token class must not have: Pooka's own, and the ones
+/// the generated modules already use.
+reserved() -> List(String) {
+  [
+    "True",
+    "False",
+    "Nil",
+    "Int",
+    "Float",
+    "String",
+    "Bool",
+    "BitArray",
+    "UtfCodepoint",
+    "Pid",
+    "List",
+    "Option",
+    "Result",
+    "Some",
+    "None",
+    "Ok",
+    "Error",
+    "Token",
+    "Lexeme",
+    "End",
+    "Position",
+    "Span"
+  ]
+}
+
+/// Is this one of the names in `reserved()`?
+is_reserved(name: String) -> Bool {
+  list.contains(reserved(), name)
+}
+
+/// The class name for a fixed token, from `[tokens.names]` if it has one
+/// there, or derived. `section` (such as `Literal`) is added to a derived
+/// name that would clash with a reserved one.
+///
+/// ```pooka
+/// import lexie/name
+///
+/// let ordinary = name.token_name("int", [], "Keyword") // Ok("IntKeyword")
+/// let renamed = name.token_name("|>", [#("|>", "Pipe")], "Operator") // Ok("Pipe")
+/// ```
+token_name(
+  text: String,
+  overrides: List(#(String, String)),
+  section: String
+) -> Result(String, String) {
+  match list.find(overrides, fn(pair: #(String, String)) { pair.0 == text }) {
+    Some(#(_, given)) -> match is_valid_class(given) {
+      True -> Ok(given)
+      False -> Error(
+        "the name `" + given + "` is not a valid Pooka class name (expected something like `MyToken`)"
+      )
+    }
+    None -> {
+      let derived = derive(text)?
+      match is_reserved(derived) {
+        True -> Ok(derived + section)
+        False -> Ok(derived)
+      }
+    }
+  }
+}
+
+/// The name for a piece of text, without overrides.
+///
+/// ```pooka
+/// import lexie/name
+///
+/// assert name.derive("==") == Ok("EqualEqual")
+/// assert name.derive("set-car!") == Ok("SetMinusCarBang")
+/// ```
+derive(text: String) -> Result(String, String) {
+  match text {
+    "" -> Error("token text cannot be empty")
+    _ -> {
+      let parts = _joined(_runs(string.split(text, ""), [], []))
+      list.fold(
+        parts,
+        Ok(""),
+        fn(acc: Result(String, String), part: #(Bool, String)) {
+          let so_far = acc?
+          match part {
+            #(True, word) -> Ok(so_far + _capitalise(word))
+            #(False, "_") -> Ok(so_far + "Underscore")
+            #(False, symbol) -> match symbol_name(symbol) {
+              Some(spelled) -> Ok(so_far + spelled)
+              None -> Error(
+                "cannot derive a class name from `" + text + "` because of `" + symbol + "`; add a name for it under [tokens.names]"
+              )
+            }
+          }
+        }
+      )
+    }
+  }
+}
+
+/// An underscore between two words only joins them, the way snake_case
+/// does: `else_if` is the words `else` and `if`. Anywhere else, such as on
+/// its own or at either end, it stays a symbol and is spelled out.
+_joined(parts: List(#(Bool, String))) -> List(#(Bool, String)) {
+  match parts {
+    [#(True, before), #(False, "_"), #(True, after), ..rest] -> list.prepend(
+      _joined(list.prepend(rest, #(True, after))),
+      #(True, before)
+    )
+    [part, ..rest] -> list.prepend(_joined(rest), part)
+    [] -> []
+  }
+}
+
+/// Split into runs of letters and digits (`#(True, word)`) and single
+/// symbols (`#(False, symbol)`).
+_runs(
+  characters: List(String),
+  word: List(String),
+  parts: List(#(Bool, String))
+) -> List(#(Bool, String)) {
+  match characters {
+    [] -> list.reverse(_finish(word, parts))
+    [c, ..rest] -> match is_letter(c) || is_digit(c) {
+      True -> _runs(rest, list.prepend(word, c), parts)
+      False -> _runs(rest, [], list.prepend(_finish(word, parts), #(False, c)))
+    }
+  }
+}
+
+_finish(word: List(String), parts: List(#(Bool, String))) -> List(
+  #(Bool, String)
+) {
+  match word {
+    [] -> parts
+    _ -> list.prepend(parts, #(True, string.join(list.reverse(word), "")))
+  }
+}
+
+_capitalise(word: String) -> String {
+  string.uppercase(string.slice(word, 0, 1)) + string.drop_start(word, 1)
+}
+
+/// The code of a single-character string, or -1.
+code(character: String) -> Int {
+  match string.to_list(character) {
+    [only] -> only
+    _ -> -1
+  }
+}
+
+/// Is this a single ASCII letter?
+is_letter(character: String) -> Bool {
+  let c = code(character)
+  (
+    c >= 97 && c <= 122
+  ) || (c >= 65 && c <= 90)
+}
+
+/// Is this a single ASCII digit?
+is_digit(character: String) -> Bool {
+  let c = code(character)
+  c >= 48 && c <= 57
+}
+
+/// Is every character of the text ASCII?
+is_ascii(text: String) -> Bool {
+  text != "" && list.all(string.to_list(text), fn(c: Int) { c <= 127 })
+}
+
+/// Spelled-out names for ASCII symbols.
+symbol_name(symbol: String) -> Option(String) {
+  match symbol {
+    "!" -> Some("Bang")
+    "\"" -> Some("DoubleQuote")
+    "#" -> Some("Hash")
+    "$" -> Some("Dollar")
+    "%" -> Some("Percent")
+    "&" -> Some("Amper")
+    "'" -> Some("Quote")
+    "(" -> Some("LeftParen")
+    ")" -> Some("RightParen")
+    "*" -> Some("Star")
+    "+" -> Some("Plus")
+    "," -> Some("Comma")
+    "-" -> Some("Minus")
+    "." -> Some("Dot")
+    "/" -> Some("Slash")
+    ":" -> Some("Colon")
+    ";" -> Some("Semicolon")
+    "<" -> Some("Less")
+    "=" -> Some("Equal")
+    ">" -> Some("Greater")
+    "?" -> Some("Question")
+    "@" -> Some("At")
+    "[" -> Some("LeftSquare")
+    "\\" -> Some("Backslash")
+    "]" -> Some("RightSquare")
+    "^" -> Some("Caret")
+    "`" -> Some("Backtick")
+    "{" -> Some("LeftBrace")
+    "|" -> Some("VBar")
+    "}" -> Some("RightBrace")
+    "~" -> Some("Tilde")
+    _ -> None
+  }
+}
+
+/// Is this a valid Pooka class name: an uppercase letter, then letters and
+/// digits?
+is_valid_class(name: String) -> Bool {
+  match string.to_list(name) {
+    [first, ..rest] -> first >= 65 && first <= 90 && list.all(rest, fn(c: Int) {
+      (
+        c >= 97 && c <= 122
+      ) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+    })
+    [] -> False
+  }
+}
+
+/// Words Pooka keeps for itself, which cannot be module names.
+_keywords() -> List(String) {
+  [
+    "module",
+    "import",
+    "class",
+    "actor",
+    "enum",
+    "interface",
+    "external",
+    "match",
+    "case",
+    "let",
+    "var",
+    "loop",
+    "in",
+    "break",
+    "continue",
+    "test",
+    "skip",
+    "assert",
+    "panic",
+    "todo",
+    "echo",
+    "fn",
+    "new",
+    "self",
+    "super",
+    "is",
+    "with",
+    "be",
+    "from",
+    "as",
+    "if",
+    "else",
+    "return"
+  ]
+}
+
+/// A module path: lowercase snake_case pieces, separated by `/`.
+is_valid_module(path: String) -> Bool {
+  path != "" && list.all(string.split(path, "/"), fn(piece: String) {
+    match string.to_list(piece) {
+      [first, ..rest] -> first >= 97 && first <= 122 && list.all(
+        rest,
+        fn(c: Int) {
+          (
+            c >= 97 && c <= 122
+          ) || (c >= 48 && c <= 57) || c == 95
+        }
+      ) && !list.contains(_keywords(), piece)
+      [] -> False
+    }
+  })
+}

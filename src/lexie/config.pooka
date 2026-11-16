@@ -1,0 +1,941 @@
+//// Every lexer begins as a wish list: these words, those symbols, numbers
+//// that look like this.
+////
+//// The specification: what the lexer should recognise, with its defaults,
+//// read from TOML.
+////
+//// Reading is lenient about missing sections, where defaults apply, and
+//// strict about types and unknown keys. Every problem is collected as a
+//// `ConfigError`, so all of them can be shown at once.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module config
+
+import pooka/bit_array
+import pooka/list
+import pooka/string
+import tome.{Toml}
+
+/// A whole specification.
+class Config(
+  /// `[module] name`: generated modules go in `src/<name>/`. Empty means
+  /// `src/` itself.
+  module_name: String,
+  /// `[output] dir`: the root folder for generated files.
+  output_dir: String,
+  /// `[highlighter] enabled`
+  highlighter: Bool,
+  whitespace: Whitespace,
+  keywords: List(String),
+  literals: List(String),
+  operators: List(String),
+  punctuation: List(String),
+  /// `[tokens.names]`: class names chosen by hand, keyed by source text.
+  names: List(#(String, String)),
+  identifier: Identifier,
+  comments: Comments,
+  /// `[strings.*]`, sorted by style name.
+  strings: List(StringStyle),
+  chars: Option(Chars),
+  numbers: Numbers,
+  /// `[errors] token`: the class for unexpected input.
+  error_token: String,
+  /// `location-info`: lex returns located lexemes when true, plain tokens otherwise.
+  location_info: Bool,
+)
+
+class Whitespace(items: List(String), emit: Bool, token: String)
+
+class Identifier(
+  enabled: Bool,
+  start: List(CharClass),
+  more: List(CharClass),
+  unicode: Bool,
+  token: String,
+)
+
+/// A character class entry, such as `"a-z"` or `"_?!"`.
+class CharClass {}
+
+class Range(from: String, to: String) is CharClass
+
+class Set(characters: List(String)) is CharClass
+
+class LineComment(start: String, emit: Bool, token: String)
+
+class BlockComment(
+  start: String,
+  finish: String,
+  nested: Bool,
+  emit: Bool,
+  token: String
+)
+
+class Comments(
+  line: Option(LineComment),
+  doc: Option(LineComment),
+  module_doc: Option(LineComment),
+  block: Option(BlockComment),
+)
+
+class StringStyle(
+  /// The `[strings.<name>]` key, used in the generated scanner's name.
+  name: String,
+  quote: String,
+  prefix: String,
+  escapes: Bool,
+  multiline: Bool,
+  token: String,
+)
+
+/// How characters are written.
+class Chars {}
+
+/// `'a'`: delimited on both sides.
+class QuotedChars(quote: String, escapes: Bool, token: String) is Chars
+
+/// `$a`: a prefix, then one character.
+class PrefixedChars(prefix: String, escapes: Bool, token: String) is Chars
+
+class Numbers(
+  int_enabled: Bool,
+  int_token: String,
+  float_enabled: Bool,
+  float_token: String,
+  /// Between digit groups, such as `_` in `1_000`.
+  separator: Option(String),
+  exponent_markers: List(String),
+  /// Let `1e3`, an exponent without a decimal point, be a float.
+  exponent_after_int: Bool,
+  hex_prefix: Option(String),
+  binary_prefix: Option(String),
+  octal_prefix: Option(String),
+  suffixes: List(String),
+)
+
+/// Something wrong with the specification: where, and what.
+class ConfigError(location: String, message: String)
+
+// --- defaults -------------------------------------------------------------------------
+
+/// The specification an empty file describes: identifiers, integers and
+/// floats, a few whitespace characters, and nothing else. Every section of
+/// a real specification is read on top of this.
+///
+/// ```pooka
+/// import lexie/config
+///
+/// let defaults = config.default_config()
+/// assert defaults.output_dir == "src"
+/// assert defaults.identifier.token == "Ident"
+/// assert defaults.numbers.int_token == "IntLiteral"
+/// ```
+default_config() -> Config {
+  Config(
+    "",
+    "src",
+    False,
+    _default_whitespace(),
+    [],
+    [],
+    [],
+    [],
+    [],
+    _default_identifier(),
+    Comments(None, None, None, None),
+    [],
+    None,
+    _default_numbers(),
+    "Unexpected",
+    True
+  )
+}
+
+_default_whitespace() -> Whitespace {
+  Whitespace([" ", "\t", "\r\n", "\n", "\r"], False, "Whitespace")
+}
+
+_default_identifier() -> Identifier {
+  Identifier(
+    True,
+    [Range("a", "z"), Range("A", "Z"), Set(["_"])],
+    [Range("a", "z"), Range("A", "Z"), Range("0", "9"), Set(["_"])],
+    False,
+    "Ident"
+  )
+}
+
+_default_numbers() -> Numbers {
+  Numbers(
+    True,
+    "IntLiteral",
+    True,
+    "FloatLiteral",
+    None,
+    ["e", "E"],
+    False,
+    None,
+    None,
+    None,
+    []
+  )
+}
+
+// --- reading --------------------------------------------------------------------------
+
+/// Build a specification from a TOML document, collecting every problem.
+/// Missing sections use defaults; invalid values remain in the problem list.
+///
+/// ```pooka
+/// import lexie/config
+/// import tome
+///
+/// let assert Ok(document) = tome.parse("[keywords]\nitems = [\"let\"]")
+/// let #(specification, problems) = config.parse(document)
+/// // specification.keywords is ["let"], and problems is empty.
+/// ```
+parse(doc: Toml) -> #(Config, List(ConfigError)) {
+  let errors = _unknown_sections(doc)
+  let errors = list.fold(
+    [
+      #("module", ["name"]),
+      #("output", ["dir"]),
+      #("highlighter", ["enabled"]),
+      #("comments", ["line", "doc", "module", "block"]),
+      #("numbers", ["int", "float", "prefixes", "suffixes"]),
+      #("tokens", ["names"])
+    ],
+    errors,
+    fn(acc: List(ConfigError), section: #(String, List(String))) {
+      _known_keys(doc, section.0, section.1, acc)
+    }
+  )
+  let #(module_name, errors) = _text_or(doc, ["module", "name"], "", errors)
+  let #(output_dir, errors) = _text_or(doc, ["output", "dir"], "src", errors)
+  let #(highlighter, errors) = _flag_or(
+    doc,
+    ["highlighter", "enabled"],
+    False,
+    errors
+  )
+  let #(whitespace, errors) = _whitespace(doc, errors)
+  let #(keywords, errors) = _items(doc, "keywords", errors)
+  let #(literals, errors) = _items(doc, "literals", errors)
+  let #(operators, errors) = _items(doc, "operators", errors)
+  let #(punctuation, errors) = _items(doc, "punctuation", errors)
+  let #(names, errors) = _names(doc, errors)
+  let #(identifier, errors) = _identifier(doc, errors)
+  let #(comments, errors) = _comments(doc, errors)
+  let #(strings, errors) = _strings(doc, errors)
+  let #(chars, errors) = _chars(doc, errors)
+  let #(numbers, errors) = _numbers(doc, errors)
+  let #(error_token, errors) = _text_or(
+    doc,
+    ["errors", "token"],
+    "Unexpected",
+    errors
+  )
+  let #(location_info, errors) = _flag_or(doc, ["location-info"], True, errors)
+  let config = Config(
+    module_name,
+    output_dir,
+    highlighter,
+    whitespace,
+    keywords,
+    literals,
+    operators,
+    punctuation,
+    names,
+    identifier,
+    comments,
+    strings,
+    chars,
+    numbers,
+    error_token,
+    location_info
+  )
+  #(config, list.unique(list.reverse(errors)))
+}
+
+/// The top-level settings a specification may have.
+known_sections() -> List(String) {
+  [
+    "location-info",
+    "module",
+    "output",
+    "highlighter",
+    "whitespace",
+    "keywords",
+    "literals",
+    "operators",
+    "punctuation",
+    "tokens",
+    "identifier",
+    "comments",
+    "strings",
+    "chars",
+    "numbers",
+    "errors"
+  ]
+}
+
+_unknown_sections(doc: Toml) -> List(ConfigError) {
+  let keys = match tome.as_entries(doc) {
+    Some(entries) -> list.map(entries, fn(e: #(String, Toml)) { e.0 })
+    None -> []
+  }
+  list.reverse(list.map(
+    list.sort(list.filter(keys, fn(k: String) {
+      !list.contains(known_sections(), k)
+    })),
+    fn(k: String) {
+      ConfigError(
+        "[" + k + "]",
+        "unknown section; known sections are: " + string.join(
+          known_sections(),
+          ", "
+        )
+      )
+    }
+  ))
+}
+
+_whitespace(doc: Toml, errors: List(ConfigError)) -> #(
+  Whitespace,
+  List(ConfigError)
+) {
+  let default = _default_whitespace()
+  let errors = _known_keys(
+    doc,
+    "whitespace",
+    ["items", "emit", "token"],
+    errors
+  )
+  let #(items, errors) = _texts_or(
+    doc,
+    ["whitespace", "items"],
+    default.items,
+    errors
+  )
+  let #(emit, errors) = _flag_or(doc, ["whitespace", "emit"], False, errors)
+  let #(token, errors) = _text_or(
+    doc,
+    ["whitespace", "token"],
+    default.token,
+    errors
+  )
+  #(Whitespace(items, emit, token), errors)
+}
+
+_names(doc: Toml, errors: List(ConfigError)) -> #(
+  List(#(String, String)),
+  List(ConfigError)
+) {
+  match tome.path(doc, ["tokens", "names"]) {
+    None -> #([], errors)
+    Some(table) -> match tome.as_entries(table) {
+      None -> #(
+        [],
+        list.prepend(errors, _wrong_type(["tokens", "names"], "a table"))
+      )
+      Some(entries) -> list.fold(
+        entries,
+        #([], errors),
+        fn(
+          acc: #(List(#(String, String)), List(ConfigError)),
+          entry: #(String, Toml)
+        ) {
+          let #(names, errs) = acc
+          match tome.as_string(entry.1) {
+            Some(given) -> #(list.append(names, #(entry.0, given)), errs)
+            None -> #(
+              names,
+              list.prepend(
+                errs,
+                _wrong_type(["tokens", "names", entry.0], "a string")
+              )
+            )
+          }
+        }
+      )
+    }
+  }
+}
+
+_identifier(doc: Toml, errors: List(ConfigError)) -> #(
+  Identifier,
+  List(ConfigError)
+) {
+  let default = _default_identifier()
+  let errors = _known_keys(
+    doc,
+    "identifier",
+    ["enabled", "start", "continue", "unicode", "token"],
+    errors
+  )
+  let #(enabled, errors) = _flag_or(
+    doc,
+    ["identifier", "enabled"],
+    True,
+    errors
+  )
+  let #(start, errors) = _classes_or(
+    doc,
+    ["identifier", "start"],
+    default.start,
+    errors
+  )
+  let #(more, errors) = _classes_or(
+    doc,
+    ["identifier", "continue"],
+    default.more,
+    errors
+  )
+  let #(unicode, errors) = _flag_or(
+    doc,
+    ["identifier", "unicode"],
+    False,
+    errors
+  )
+  let #(token, errors) = _text_or(
+    doc,
+    ["identifier", "token"],
+    default.token,
+    errors
+  )
+  #(Identifier(enabled, start, more, unicode, token), errors)
+}
+
+_comments(doc: Toml, errors: List(ConfigError)) -> #(
+  Comments,
+  List(ConfigError)
+) {
+  let #(line, errors) = _line_comment(doc, "line", "Comment", errors)
+  let #(doc_comment, errors) = _line_comment(doc, "doc", "DocComment", errors)
+  let #(module_doc, errors) = _line_comment(
+    doc,
+    "module",
+    "ModuleComment",
+    errors
+  )
+  let #(block, errors) = _block_comment(doc, errors)
+  #(Comments(line, doc_comment, module_doc, block), errors)
+}
+
+_line_comment(
+  doc: Toml,
+  kind: String,
+  default_token: String,
+  errors: List(ConfigError)
+) -> #(Option(LineComment), List(ConfigError)) {
+  match tome.path(doc, ["comments", kind]) {
+    None -> #(None, errors)
+    Some(_) -> {
+      let errors = _known_keys(
+        doc,
+        "comments." + kind,
+        ["start", "emit", "token"],
+        errors
+      )
+      let #(start, errors) = _required_text(
+        doc,
+        ["comments", kind, "start"],
+        errors
+      )
+      let #(emit, errors) = _flag_or(
+        doc,
+        ["comments", kind, "emit"],
+        kind != "line",
+        errors
+      )
+      let #(token, errors) = _text_or(
+        doc,
+        ["comments", kind, "token"],
+        default_token,
+        errors
+      )
+      match start {
+        Some(found) -> #(Some(LineComment(found, emit, token)), errors)
+        None -> #(None, errors)
+      }
+    }
+  }
+}
+
+_block_comment(doc: Toml, errors: List(ConfigError)) -> #(
+  Option(BlockComment),
+  List(ConfigError)
+) {
+  match tome.path(doc, ["comments", "block"]) {
+    None -> #(None, errors)
+    Some(_) -> {
+      let errors = _known_keys(
+        doc,
+        "comments.block",
+        ["start", "end", "nested", "emit", "token"],
+        errors
+      )
+      let #(start, errors) = _required_text(
+        doc,
+        ["comments", "block", "start"],
+        errors
+      )
+      let #(finish, errors) = _required_text(
+        doc,
+        ["comments", "block", "end"],
+        errors
+      )
+      let #(nested, errors) = _flag_or(
+        doc,
+        ["comments", "block", "nested"],
+        False,
+        errors
+      )
+      let #(emit, errors) = _flag_or(
+        doc,
+        ["comments", "block", "emit"],
+        False,
+        errors
+      )
+      let #(token, errors) = _text_or(
+        doc,
+        ["comments", "block", "token"],
+        "BlockComment",
+        errors
+      )
+      match #(start, finish) {
+        #(Some(s), Some(f)) -> #(
+          Some(BlockComment(s, f, nested, emit, token)),
+          errors
+        )
+        _ -> #(None, errors)
+      }
+    }
+  }
+}
+
+_strings(doc: Toml, errors: List(ConfigError)) -> #(
+  List(StringStyle),
+  List(ConfigError)
+) {
+  match tome.get(doc, "strings") {
+    None -> #([], errors)
+    Some(table) -> match tome.as_entries(table) {
+      None -> #([], list.prepend(errors, _wrong_type(["strings"], "a table")))
+      Some(entries) -> {
+        let names = list.sort(list.map(entries, fn(e: #(String, Toml)) { e.0 }))
+        list.fold(
+          names,
+          #([], errors),
+          fn(
+            acc: #(List(StringStyle), List(ConfigError)),
+            style_name: String
+          ) {
+            let #(styles, errs) = acc
+            let #(style, errs) = _string_style(doc, style_name, errs)
+            match style {
+              Some(found) -> #(list.append(styles, found), errs)
+              None -> #(styles, errs)
+            }
+          }
+        )
+      }
+    }
+  }
+}
+
+_string_style(doc: Toml, style_name: String, errors: List(ConfigError)) -> #(
+  Option(StringStyle),
+  List(ConfigError)
+) {
+  let errors = _known_keys(
+    doc,
+    "strings." + style_name,
+    ["quote", "prefix", "escapes", "multiline", "token"],
+    errors
+  )
+  let #(quote, errors) = _required_text(
+    doc,
+    ["strings", style_name, "quote"],
+    errors
+  )
+  let #(prefix, errors) = _text_or(
+    doc,
+    ["strings", style_name, "prefix"],
+    "",
+    errors
+  )
+  let #(escapes, errors) = _flag_or(
+    doc,
+    ["strings", style_name, "escapes"],
+    True,
+    errors
+  )
+  let #(multiline, errors) = _flag_or(
+    doc,
+    ["strings", style_name, "multiline"],
+    False,
+    errors
+  )
+  let #(token, errors) = _text_or(
+    doc,
+    ["strings", style_name, "token"],
+    "StringLiteral",
+    errors
+  )
+  match quote {
+    Some(q) -> #(
+      Some(StringStyle(style_name, q, prefix, escapes, multiline, token)),
+      errors
+    )
+    None -> #(None, errors)
+  }
+}
+
+_chars(doc: Toml, errors: List(ConfigError)) -> #(
+  Option(Chars),
+  List(ConfigError)
+) {
+  match tome.get(doc, "chars") {
+    None -> #(None, errors)
+    Some(_) -> {
+      let errors = _known_keys(
+        doc,
+        "chars",
+        ["quote", "prefix", "escapes", "token"],
+        errors
+      )
+      let #(quote, errors) = _optional_text(doc, ["chars", "quote"], errors)
+      let #(prefix, errors) = _optional_text(doc, ["chars", "prefix"], errors)
+      let #(escapes, errors) = _flag_or(doc, ["chars", "escapes"], True, errors)
+      let #(token, errors) = _text_or(
+        doc,
+        ["chars", "token"],
+        "CharLiteral",
+        errors
+      )
+      match #(quote, prefix) {
+        #(Some(q), None) -> #(Some(QuotedChars(q, escapes, token)), errors)
+        #(None, Some(p)) -> #(Some(PrefixedChars(p, escapes, token)), errors)
+        #(Some(_), Some(_)) -> #(
+          None,
+          list.prepend(
+            errors,
+            ConfigError("[chars]", "set either `quote` or `prefix`, not both")
+          )
+        )
+        #(None, None) -> #(
+          None,
+          list.prepend(
+            errors,
+            ConfigError("[chars]", "requires a `quote` or `prefix` key")
+          )
+        )
+      }
+    }
+  }
+}
+
+_numbers(doc: Toml, errors: List(ConfigError)) -> #(Numbers, List(ConfigError)) {
+  let default = _default_numbers()
+  let errors = _known_keys(
+    doc,
+    "numbers.int",
+    ["enabled", "separator", "token"],
+    errors
+  )
+  let errors = _known_keys(
+    doc,
+    "numbers.float",
+    ["enabled", "exponent", "exponent_after_int", "token"],
+    errors
+  )
+  let errors = _known_keys(
+    doc,
+    "numbers.prefixes",
+    ["hex", "binary", "octal"],
+    errors
+  )
+  let errors = _known_keys(doc, "numbers.suffixes", ["items"], errors)
+  let #(int_enabled, errors) = _flag_or(
+    doc,
+    ["numbers", "int", "enabled"],
+    True,
+    errors
+  )
+  let #(int_token, errors) = _text_or(
+    doc,
+    ["numbers", "int", "token"],
+    default.int_token,
+    errors
+  )
+  let #(separator, errors) = _optional_text(
+    doc,
+    ["numbers", "int", "separator"],
+    errors
+  )
+  let #(float_enabled, errors) = _flag_or(
+    doc,
+    ["numbers", "float", "enabled"],
+    True,
+    errors
+  )
+  let #(float_token, errors) = _text_or(
+    doc,
+    ["numbers", "float", "token"],
+    default.float_token,
+    errors
+  )
+  let #(markers, errors) = _texts_or(
+    doc,
+    ["numbers", "float", "exponent"],
+    default.exponent_markers,
+    errors
+  )
+  let #(after_int, errors) = _flag_or(
+    doc,
+    ["numbers", "float", "exponent_after_int"],
+    False,
+    errors
+  )
+  let #(hex, errors) = _optional_text(
+    doc,
+    ["numbers", "prefixes", "hex"],
+    errors
+  )
+  let #(binary, errors) = _optional_text(
+    doc,
+    ["numbers", "prefixes", "binary"],
+    errors
+  )
+  let #(octal, errors) = _optional_text(
+    doc,
+    ["numbers", "prefixes", "octal"],
+    errors
+  )
+  let #(suffixes, errors) = _items(doc, "numbers.suffixes", errors)
+  #(
+    Numbers(
+      int_enabled,
+      int_token,
+      float_enabled,
+      float_token,
+      separator,
+      markers,
+      after_int,
+      hex,
+      binary,
+      octal,
+      suffixes
+    ),
+    errors
+  )
+}
+
+// --- character classes ---------------------------------------------------------------------
+
+/// `"a-z"` is a range; anything else is a set of characters.
+///
+/// ```pooka
+/// import lexie/config
+///
+/// assert config.parse_class("a-z") == config.Range("a", "z")
+/// assert config.parse_class("_?!") == config.Set(["_", "?", "!"])
+/// ```
+parse_class(spec: String) -> CharClass {
+  match string.split(spec, "") {
+    [from, "-", to] -> Range(from, to)
+    characters -> Set(characters)
+  }
+}
+
+/// Every member of the classes, in order, without repeats. Ranges are
+/// expanded only when both ends are ASCII.
+class_chars(classes: List(CharClass)) -> List(String) {
+  list.unique(list.flat_map(classes, fn(c: CharClass) {
+    match c {
+      Set(characters) -> characters
+      Range(from, to) -> match #(string.to_list(from), string.to_list(to)) {
+        #([low], [high]) if low <= 127 && high <= 127 && low <= high -> list.map(
+          list.range(low, high + 1),
+          fn(code: Int) { _ascii(code) }
+        )
+        _ -> []
+      }
+    }
+  }))
+}
+
+/// An ASCII code as a one-character string.
+_ascii(code: Int) -> String {
+  match bit_array.to_string(<<code:size(8)>>) {
+    Ok(text) -> text
+    Error(_) -> ""
+  }
+}
+
+// --- reading values ------------------------------------------------------------------------
+
+_wrong_type(keys: List(String), expected: String) -> ConfigError {
+  ConfigError(string.join(keys, "."), "must be " + expected)
+}
+
+_text_or(
+  doc: Toml,
+  keys: List(String),
+  default: String,
+  errors: List(ConfigError)
+) -> #(String, List(ConfigError)) {
+  match tome.path(doc, keys) {
+    None -> #(default, errors)
+    Some(value) -> match tome.as_string(value) {
+      Some(text) -> #(text, errors)
+      None -> #(default, list.prepend(errors, _wrong_type(keys, "a string")))
+    }
+  }
+}
+
+_optional_text(doc: Toml, keys: List(String), errors: List(ConfigError)) -> #(
+  Option(String),
+  List(ConfigError)
+) {
+  match tome.path(doc, keys) {
+    None -> #(None, errors)
+    Some(value) -> match tome.as_string(value) {
+      Some(text) -> #(Some(text), errors)
+      None -> #(None, list.prepend(errors, _wrong_type(keys, "a string")))
+    }
+  }
+}
+
+_required_text(doc: Toml, keys: List(String), errors: List(ConfigError)) -> #(
+  Option(String),
+  List(ConfigError)
+) {
+  match tome.path(doc, keys) {
+    None -> #(
+      None,
+      list.prepend(errors, ConfigError(string.join(keys, "."), "is required"))
+    )
+    Some(value) -> match tome.as_string(value) {
+      Some(text) -> #(Some(text), errors)
+      None -> #(None, list.prepend(errors, _wrong_type(keys, "a string")))
+    }
+  }
+}
+
+_flag_or(
+  doc: Toml,
+  keys: List(String),
+  default: Bool,
+  errors: List(ConfigError)
+) -> #(Bool, List(ConfigError)) {
+  match tome.path(doc, keys) {
+    None -> #(default, errors)
+    Some(value) -> match tome.as_bool(value) {
+      Some(truth) -> #(truth, errors)
+      None -> #(default, list.prepend(errors, _wrong_type(keys, "a boolean")))
+    }
+  }
+}
+
+_texts_or(
+  doc: Toml,
+  keys: List(String),
+  default: List(String),
+  errors: List(ConfigError)
+) -> #(List(String), List(ConfigError)) {
+  match tome.path(doc, keys) {
+    None -> #(default, errors)
+    Some(value) -> match tome.as_list(value) {
+      None -> #(
+        default,
+        list.prepend(errors, _wrong_type(keys, "an array of strings"))
+      )
+      Some(items) -> {
+        let texts = list.filter_map(items, tome.as_string)
+        match list.length(texts) == list.length(items) {
+          True -> #(texts, errors)
+          False -> #(
+            default,
+            list.prepend(errors, _wrong_type(keys, "an array of strings"))
+          )
+        }
+      }
+    }
+  }
+}
+
+_classes_or(
+  doc: Toml,
+  keys: List(String),
+  default: List(CharClass),
+  errors: List(ConfigError)
+) -> #(List(CharClass), List(ConfigError)) {
+  match tome.path(doc, keys) {
+    None -> #(default, errors)
+    Some(_) -> {
+      let #(specs, errs) = _texts_or(doc, keys, [], errors)
+      match list.length(errs) == list.length(errors) {
+        True -> #(list.map(specs, parse_class), errs)
+        False -> #(default, errs)
+      }
+    }
+  }
+}
+
+/// A section's `items` array, empty by default.
+_items(doc: Toml, section: String, errors: List(ConfigError)) -> #(
+  List(String),
+  List(ConfigError)
+) {
+  let keys = list.append(string.split(section, "."), "items")
+  let errors = match list.contains(
+    ["keywords", "literals", "operators", "punctuation"],
+    section
+  ) {
+    True -> _known_keys(doc, section, ["items"], errors)
+    False -> errors
+  }
+  _texts_or(doc, keys, [], errors)
+}
+
+/// Report keys a section does not know, so typos do not vanish quietly.
+_known_keys(
+  doc: Toml,
+  section: String,
+  allowed: List(String),
+  errors: List(ConfigError)
+) -> List(ConfigError) {
+  let keys = string.split(section, ".")
+  match tome.path(doc, keys) {
+    None -> errors
+    Some(value) -> match tome.as_entries(value) {
+      None -> list.prepend(errors, _wrong_type(keys, "a table"))
+      Some(entries) -> list.fold(
+        list.sort(
+          list.filter(
+            list.map(entries, fn(e: #(String, Toml)) { e.0 }),
+            fn(k: String) {
+              !list.contains(allowed, k)
+            }
+          )
+        ),
+        errors,
+        fn(acc: List(ConfigError), key: String) {
+          list.prepend(
+            acc,
+            ConfigError(
+              "[" + section + "]",
+              "unknown key `" + key + "`; allowed keys are: " + string.join(
+                allowed,
+                ", "
+              )
+            )
+          )
+        }
+      )
+    }
+  }
+}

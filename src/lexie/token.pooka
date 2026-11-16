@@ -1,0 +1,197 @@
+//// The cast list: everyone who will appear in the generated `Token` family.
+////
+//// Every class the generated `Token` family will have, worked out from a
+//// specification. Shared by the generators and the checks.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module token
+
+import lexie/config.{Config, LineComment, PrefixedChars, QuotedChars, StringStyle}
+import lexie/name
+import pooka/list
+
+/// Where a token class comes from.
+class Kind {}
+
+class Keyword(text: String) is Kind
+
+class Literal(text: String) is Kind
+
+class Operator(text: String) is Kind
+
+class Punctuation(text: String) is Kind
+
+class IdentKind is Kind {}
+
+class IntKind is Kind {}
+
+class FloatKind is Kind {}
+
+class StringKind is Kind {}
+
+class CharKind is Kind {}
+
+class CommentKind is Kind {}
+
+class DocCommentKind is Kind {}
+
+class ModuleCommentKind is Kind {}
+
+class BlockCommentKind is Kind {}
+
+class WhitespaceKind is Kind {}
+
+class ErrorKind is Kind {}
+
+class EndKind is Kind {}
+
+/// One token class: its name, whether it carries text, and its kind.
+class TokenDef(name: String, payload: Bool, kind: Kind)
+
+/// The class name for a fixed token in a section such as `Keyword`. Falls
+/// back to `Invalid`; the checks report that before anything is generated.
+fixed_name(config: Config, text: String, section: String) -> String {
+  match name.token_name(text, config.names, section) {
+    Ok(found) -> found
+    Error(_) -> "Invalid"
+  }
+}
+
+/// The class for a keyword or literal, by its text.
+word_name(config: Config, text: String) -> String {
+  match list.contains(config.keywords, text) {
+    True -> fixed_name(config, text, "Keyword")
+    False -> fixed_name(config, text, "Literal")
+  }
+}
+
+/// The class for an operator or punctuation, by its text.
+symbol_name(config: Config, text: String) -> String {
+  match list.contains(config.operators, text) {
+    True -> fixed_name(config, text, "Operator")
+    False -> fixed_name(config, text, "Punctuation")
+  }
+}
+
+/// Every class of the generated family, in declaration order.
+///
+/// ```pooka
+/// import lexie/config
+/// import lexie/token
+///
+/// let definitions = token.definitions(config.default_config())
+/// // Ident, numeric and error/end definitions follow the fixed tokens.
+/// ```
+definitions(config: Config) -> List(TokenDef) {
+  let keywords = list.map(config.keywords, fn(t: String) {
+    TokenDef(fixed_name(config, t, "Keyword"), False, Keyword(t))
+  })
+  let literals = list.map(config.literals, fn(t: String) {
+    TokenDef(fixed_name(config, t, "Literal"), False, Literal(t))
+  })
+  let operators = list.map(config.operators, fn(t: String) {
+    TokenDef(fixed_name(config, t, "Operator"), False, Operator(t))
+  })
+  let punctuation = list.map(config.punctuation, fn(t: String) {
+    TokenDef(fixed_name(config, t, "Punctuation"), False, Punctuation(t))
+  })
+  let ident: List(TokenDef) = match config.identifier.enabled {
+    True -> [TokenDef(config.identifier.token, True, IdentKind())]
+    False -> []
+  }
+  let numbers = config.numbers
+  let ints: List(TokenDef) = match numbers.int_enabled {
+    True -> [TokenDef(numbers.int_token, True, IntKind())]
+    False -> []
+  }
+  let floats: List(TokenDef) = match numbers.int_enabled && numbers.float_enabled {
+    True -> [TokenDef(numbers.float_token, True, FloatKind())]
+    False -> []
+  }
+  // Several string styles may share one class, such as raw and plain
+  // strings both making `StringLiteral`.
+  let strings = list.map(
+    list.unique(list.map(config.strings, fn(s: StringStyle) { s.token })),
+    fn(t: String) { TokenDef(t, True, StringKind()) }
+  )
+  let chars: List(TokenDef) = match config.chars {
+    Some(QuotedChars(_, _, t)) -> [TokenDef(t, True, CharKind())]
+    Some(PrefixedChars(_, _, t)) -> [TokenDef(t, True, CharKind())]
+    _ -> []
+  }
+  let line_kinds: List(#(Option(LineComment), Kind)) = [
+    #(config.comments.line, CommentKind()),
+    #(config.comments.doc, DocCommentKind()),
+    #(config.comments.module_doc, ModuleCommentKind())
+  ]
+  let comments = list.filter_map(
+    line_kinds,
+    fn(pair: #(Option(LineComment), Kind)) {
+      match pair.0 {
+        Some(c) if c.emit -> Some(TokenDef(c.token, True, pair.1))
+        _ -> None
+      }
+    }
+  )
+  let block: List(TokenDef) = match config.comments.block {
+    Some(b) if b.emit -> [TokenDef(b.token, True, BlockCommentKind())]
+    _ -> []
+  }
+  let whitespace: List(TokenDef) = match config.whitespace.emit {
+    True -> [TokenDef(config.whitespace.token, True, WhitespaceKind())]
+    False -> []
+  }
+  let control: List(TokenDef) = [
+    TokenDef(config.error_token, True, ErrorKind()),
+    TokenDef("End", False, EndKind())
+  ]
+  list.flat_map(
+    [
+      keywords,
+      literals,
+      operators,
+      punctuation,
+      ident,
+      ints,
+      floats,
+      strings,
+      chars,
+      comments,
+      block,
+      whitespace,
+      control
+    ],
+    fn(group: List(TokenDef)) { group }
+  )
+}
+
+/// Where a token class came from, for messages.
+describe(kind: Kind) -> String {
+  match kind {
+    Keyword(t) -> "keyword `" + t + "`"
+    Literal(t) -> "literal `" + t + "`"
+    Operator(t) -> "operator `" + t + "`"
+    Punctuation(t) -> "punctuation `" + t + "`"
+    IdentKind -> "[identifier] token"
+    IntKind -> "[numbers.int] token"
+    FloatKind -> "[numbers.float] token"
+    StringKind -> "[strings] token"
+    CharKind -> "[chars] token"
+    CommentKind -> "[comments.line] token"
+    DocCommentKind -> "[comments.doc] token"
+    ModuleCommentKind -> "[comments.module] token"
+    BlockCommentKind -> "[comments.block] token"
+    WhitespaceKind -> "[whitespace] token"
+    ErrorKind -> "[errors] token"
+    EndKind -> "end-of-file token"
+  }
+}
+
+/// The fixed text of a keyword, literal, operator or punctuation.
+fixed_text(kind: Kind) -> Option(String) {
+  match kind {
+    Keyword(t) | Literal(t) | Operator(t) | Punctuation(t) -> Some(t)
+    _ -> None
+  }
+}

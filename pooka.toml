@@ -1,0 +1,22 @@
+name = "lexie"
+version = "1.0.0"
+description = "Generate Pooka lexers, source spans and syntax highlighters from TOML"
+authors = ["Peregrine Finch"]
+licences = ["Apache-2.0"]
+repository = { type = "github", user = "peregrinefinch", repo = "lexie" }
+links = [
+  { title = "Issues", href = "https://github.com/peregrinefinch/lexie/issues" },
+  { title = "Compiler", href = "https://github.com/pooka-lang/pooka" },
+]
+
+[dependencies]
+tome = ">= 1.0.0 and < 2.0.0"
+pooka_stdlib = ">= 0.3.1 and < 1.0.0"
+
+[dev-dependencies]
+poke = ">= 1.0.0 and < 2.0.0"
+
+[[documentation.pages]]
+title = "Writing a lexer"
+path = "guide.html"
+source = "docs/guide.md"

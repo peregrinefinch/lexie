@@ -1,0 +1,654 @@
+//// A careful reading before anything is written down.
+////
+//// Checks a specification before anything is generated: duplicates,
+//// conflicts, invalid names, and definitions that could never match.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module check
+
+import lexie/config.{Config, ConfigError, LineComment, PrefixedChars, QuotedChars, Range, Set, StringStyle}
+import lexie/name
+import lexie/token.{TokenDef}
+import pooka/list
+import pooka/order.{Order}
+import pooka/string
+
+/// Every problem with a specification, or none, sorted so the same
+/// specification always reports the same way.
+///
+/// ```pooka
+/// import lexie/check
+/// import lexie/config
+///
+/// assert check.validate(config.default_config()) == []
+/// ```
+validate(c: Config) -> List(ConfigError) {
+  list.flat_map(
+    [
+      _paths(c),
+      _reserved(c),
+      _numeric_prefixes(c),
+      _chars(c),
+      _empty_items(c),
+      _duplicate_items(c),
+      _cross_section(c),
+      _derivation(c),
+      _collisions(c),
+      _keywords_lexable(c),
+      _wordlike_symbols(c),
+      _identifier(c),
+      _numbers(c),
+      _strings(c),
+      _comments(c),
+      _whitespace(c)
+    ],
+    fn(group: List(ConfigError)) { group }
+  )
+}
+
+_sections(c: Config) -> List(#(String, List(String))) {
+  [
+    #("[keywords]", c.keywords),
+    #("[literals]", c.literals),
+    #("[operators]", c.operators),
+    #("[punctuation]", c.punctuation),
+    #("[whitespace]", c.whitespace.items),
+    #("[numbers.suffixes]", c.numbers.suffixes),
+    #("[numbers.float] exponent", c.numbers.exponent_markers)
+  ]
+}
+
+_empty_items(c: Config) -> List(ConfigError) {
+  list.filter_map(_sections(c), fn(s: #(String, List(String))) {
+    match list.contains(s.1, "") {
+      True -> Some(ConfigError(s.0, "items must not contain empty strings"))
+      False -> None
+    }
+  })
+}
+
+_duplicate_items(c: Config) -> List(ConfigError) {
+  list.flat_map(_sections(c), fn(s: #(String, List(String))) {
+    list.map(duplicates(s.1), fn(t: String) {
+      ConfigError(s.0, "duplicate item `" + escape(t) + "`")
+    })
+  })
+}
+
+/// The same text in two sections would make one of them unreachable.
+_cross_section(c: Config) -> List(ConfigError) {
+  let tagged = fn(items: List(String), section: String) {
+    list.map(items, fn(t: String) { #(t, section) })
+  }
+  let fixed = list.flat_map(
+    [
+      tagged(c.keywords, "[keywords]"),
+      tagged(c.literals, "[literals]"),
+      tagged(c.operators, "[operators]"),
+      tagged(c.punctuation, "[punctuation]"),
+      tagged(c.whitespace.items, "[whitespace]"),
+      comment_starts(c),
+      _string_openers(c),
+      _char_opener(c),
+      _number_prefixes(c)
+    ],
+    fn(group: List(#(String, String))) { group }
+  )
+  let texts = list.unique(list.map(fixed, fn(p: #(String, String)) { p.0 }))
+  let found = list.filter_map(texts, fn(t: String) {
+    let sections = list.unique(list.filter_map(fixed, fn(p: #(String, String)) {
+      match p.0 == t {
+        True -> Some(p.1)
+        False -> None
+      }
+    }))
+    match sections {
+      [_, _, ..] -> Some(
+        ConfigError(
+          string.join(list.sort(sections), " and "),
+          "`" + escape(t) + "` is defined in more than one section"
+        )
+      )
+      _ -> None
+    }
+  })
+  list.sort_by(found, fn(a: ConfigError, b: ConfigError) {
+    string.compare(a.message, b.message)
+  })
+}
+
+/// Comment openers, with their sections.
+comment_starts(c: Config) -> List(#(String, String)) {
+  let lines: List(#(Option(LineComment), String)) = [
+    #(c.comments.line, "[comments.line]"),
+    #(c.comments.doc, "[comments.doc]"),
+    #(c.comments.module_doc, "[comments.module]")
+  ]
+  let starts = list.filter_map(lines, fn(p: #(Option(LineComment), String)) {
+    match p.0 {
+      Some(comment) -> Some(#(comment.start, p.1))
+      None -> None
+    }
+  })
+  match c.comments.block {
+    Some(block) -> list.prepend(starts, #(block.start, "[comments.block]"))
+    None -> starts
+  }
+}
+
+_string_openers(c: Config) -> List(#(String, String)) {
+  list.map(c.strings, fn(s: StringStyle) {
+    #(s.prefix + s.quote, "[strings." + s.name + "]")
+  })
+}
+
+_char_opener(c: Config) -> List(#(String, String)) {
+  match c.chars {
+    Some(QuotedChars(quote, _, _)) -> [#(quote, "[chars]")]
+    Some(PrefixedChars(prefix, _, _)) -> [#(prefix, "[chars]")]
+    _ -> []
+  }
+}
+
+_prefixes(c: Config) -> List(String) {
+  list.filter_map(
+    [c.numbers.hex_prefix, c.numbers.binary_prefix, c.numbers.octal_prefix],
+    fn(
+      p: Option(String)
+    ) { p }
+  )
+}
+
+_number_prefixes(c: Config) -> List(#(String, String)) {
+  list.map(_prefixes(c), fn(p: String) { #(p, "[numbers.prefixes]") })
+}
+
+/// Every fixed token must have a class name, derived or given.
+_derivation(c: Config) -> List(ConfigError) {
+  list.flat_map(
+    [
+      #("[keywords]", c.keywords, "Keyword"),
+      #("[literals]", c.literals, "Literal"),
+      #("[operators]", c.operators, "Operator"),
+      #("[punctuation]", c.punctuation, "Punctuation")
+    ],
+    fn(s: #(String, List(String), String)) {
+      list.filter_map(s.1, fn(t: String) {
+        match name.token_name(t, c.names, s.2) {
+          Ok(_) -> None
+          Error(reason) -> Some(ConfigError(s.0, reason))
+        }
+      })
+    }
+  )
+}
+
+/// Class names Pooka refuses, given by hand through `token` keys or
+/// `[tokens.names]`. Derived names are adjusted instead.
+_reserved(c: Config) -> List(ConfigError) {
+  list.unique(list.filter_map(token.definitions(c), fn(d: TokenDef) {
+    match #(name.is_reserved(d.name), d.kind) {
+      #(True, token.EndKind) -> None
+      #(True, kind) -> Some(
+        ConfigError(
+          token.describe(kind),
+          "`" + d.name + "` is reserved in Pooka or by the generated modules; choose another name"
+        )
+      )
+      _ -> None
+    }
+  }))
+}
+
+/// Class names must be valid and unique.
+_collisions(c: Config) -> List(ConfigError) {
+  let definitions = token.definitions(c)
+  let invalid = list.unique(list.filter_map(definitions, fn(d: TokenDef) {
+    match name.is_valid_class(d.name) {
+      True -> None
+      False -> Some(
+        ConfigError(
+          token.describe(d.kind),
+          "`" + d.name + "` is not a valid Pooka class name (expected something like `MyToken`)"
+        )
+      )
+    }
+  }))
+  let names = list.unique(list.map(definitions, fn(d: TokenDef) { d.name }))
+  let collisions = list.filter_map(names, fn(n: String) {
+    let sharing = list.filter(definitions, fn(d: TokenDef) { d.name == n })
+    match sharing {
+      [_, _, ..] -> match _same_text(sharing) {
+        // Reported already, as a duplicate or a cross-section conflict.
+        True -> None
+        False -> Some(
+          ConfigError(
+            "tokens",
+            "the class name `" + n + "` is used by " + string.join(
+              list.map(sharing, fn(d: TokenDef) { token.describe(d.kind) }),
+              " and "
+            ) + "; rename one under [tokens.names] or with a `token` key"
+          )
+        )
+      }
+      _ -> None
+    }
+  })
+  list.concat(
+    invalid,
+    list.sort_by(collisions, fn(a: ConfigError, b: ConfigError) {
+      string.compare(a.message, b.message)
+    })
+  )
+}
+
+_same_text(definitions: List(TokenDef)) -> Bool {
+  let texts = list.filter_map(definitions, fn(d: TokenDef) {
+    token.fixed_text(d.kind)
+  })
+  list.length(texts) == list.length(definitions) && list.length(
+    list.unique(texts)
+  ) == 1
+}
+
+/// Keywords are found after an identifier is scanned, so each must be
+/// scannable as an identifier.
+_keywords_lexable(c: Config) -> List(ConfigError) {
+  match c.identifier.enabled {
+    False -> match #(c.keywords, c.literals) {
+      #([], []) -> []
+      _ -> [
+        ConfigError(
+          "[identifier]",
+          "keywords and literals require identifiers to be enabled"
+        )
+      ]
+    }
+    True -> list.flat_map(
+      [#("[keywords]", c.keywords), #("[literals]", c.literals)],
+      fn(s: #(String, List(String))) {
+        list.filter_map(s.1, fn(t: String) {
+          match lexable_as_identifier(c, t) {
+            True -> None
+            False -> Some(
+              ConfigError(
+                s.0,
+                "`" + t + "` cannot be lexed as an identifier with the configured [identifier] character classes, so it would never match"
+              )
+            )
+          }
+        })
+      }
+    )
+  }
+}
+
+/// Would the identifier rules read this text as one identifier? A keyword
+/// that would not, such as `if!`, could never be lexed as a keyword.
+lexable_as_identifier(c: Config, text: String) -> Bool {
+  let start = config.class_chars(c.identifier.start)
+  let more = config.class_chars(c.identifier.more)
+  match string.split(text, "") {
+    [] -> False
+    [first, ..rest] -> _member(start, first, c.identifier.unicode) && list.all(
+      rest,
+      fn(ch: String) {
+        _member(more, ch, c.identifier.unicode)
+      }
+    )
+  }
+}
+
+_member(characters: List(String), character: String, unicode: Bool) -> Bool {
+  list.contains(characters, character) || (unicode && !name.is_ascii(character))
+}
+
+/// An operator made only of identifier characters, such as `and`, would
+/// match the start of longer identifiers, such as `android`.
+_wordlike_symbols(c: Config) -> List(ConfigError) {
+  match c.identifier.enabled {
+    False -> []
+    True -> list.flat_map(
+      [#("[operators]", c.operators), #("[punctuation]", c.punctuation)],
+      fn(s: #(String, List(String))) {
+        list.filter_map(s.1, fn(t: String) {
+          match t != "" && lexable_as_identifier(c, t) {
+            True -> Some(
+              ConfigError(
+                s.0,
+                "`" + t + "` looks like an identifier and would match the start of longer identifiers; move it to [keywords]"
+              )
+            )
+            False -> None
+          }
+        })
+      }
+    )
+  }
+}
+
+_identifier(c: Config) -> List(ConfigError) {
+  match c.identifier.enabled {
+    False -> []
+    True -> {
+      let start = config.class_chars(c.identifier.start)
+      let empty: List(ConfigError) = match start {
+        [] -> [
+          ConfigError(
+            "[identifier]",
+            "`start` must contain at least one character"
+          )
+        ]
+        _ -> []
+      }
+      let classes = list.concat(c.identifier.start, c.identifier.more)
+      let ranges = list.filter_map(classes, fn(cc: config.CharClass) {
+        match cc {
+          Range(from, to) -> {
+            let low = name.code(from)
+            let high = name.code(to)
+            match low < 0 || high < low || high > 127 {
+              True -> Some(
+                ConfigError(
+                  "[identifier]",
+                  "character ranges must be ascending ASCII ranges"
+                )
+              )
+              False -> None
+            }
+          }
+          Set(_) -> None
+        }
+      })
+      let non_ascii = list.map(
+        list.filter(config.class_chars(classes), fn(ch: String) {
+          !name.is_ascii(ch)
+        }),
+        fn(ch: String) {
+          ConfigError(
+            "[identifier]",
+            "`" + ch + "` is not ASCII; use `unicode = true` without non-ASCII class entries"
+          )
+        }
+      )
+      let hidden: List(ConfigError) = match c.numbers.int_enabled && !c.identifier.unicode && start != [] && list.all(
+        start,
+        name.is_digit
+      ) {
+        True -> [
+          ConfigError(
+            "[identifier]",
+            "all start characters are digits and are claimed by the number scanner"
+          )
+        ]
+        False -> []
+      }
+      list.flat_map(
+        [empty, non_ascii, hidden, ranges],
+        fn(g: List(ConfigError)) { g }
+      )
+    }
+  }
+}
+
+_numbers(c: Config) -> List(ConfigError) {
+  let n = c.numbers
+  let float_without_int: List(ConfigError) = match n.float_enabled && !n.int_enabled {
+    True -> [
+      ConfigError(
+        "[numbers.float]",
+        "floats require [numbers.int] to be enabled"
+      )
+    ]
+    False -> []
+  }
+  let separator: List(ConfigError) = match n.separator {
+    Some(sep) -> match string.to_list(sep) {
+      [only] -> match only > 127 || name.is_letter(sep) || name.is_digit(sep) || list.contains(
+        [".", "+", "-", " ", "\t", "\r", "\n"],
+        sep
+      ) {
+        True -> [
+          ConfigError(
+            "[numbers.int]",
+            "separator must be an ASCII punctuation character other than dot, plus, minus, or whitespace"
+          )
+        ]
+        False -> []
+      }
+      _ -> [
+        ConfigError("[numbers.int]", "`separator` must be a single character")
+      ]
+    }
+    None -> []
+  }
+  let markers: List(ConfigError) = match n.float_enabled && list.contains(
+    n.exponent_markers,
+    ""
+  ) {
+    True -> [
+      ConfigError("[numbers.float]", "`exponent` markers must not be empty")
+    ]
+    False -> []
+  }
+  let prefixes = list.flat_map(_prefixes(c), fn(p: String) {
+    match #(string.slice(p, 0, 1), string.length(p) >= 2) {
+      #(first, True) -> match name.is_digit(first) {
+        True -> []
+        False -> [
+          ConfigError(
+            "[numbers.prefixes]",
+            "`" + p + "` must start with a digit, like `0x`"
+          )
+        ]
+      }
+      _ -> [
+        ConfigError(
+          "[numbers.prefixes]",
+          "`" + p + "` must be a digit followed by a marker, like `0x`"
+        )
+      ]
+    }
+  })
+  let suffixes = list.filter_map(n.suffixes, fn(s: String) {
+    let first = string.slice(s, 0, 1)
+    match first != "" && (name.is_digit(first) || Some(first) == n.separator) {
+      True -> Some(
+        ConfigError(
+          "[numbers.suffixes]",
+          "`" + s + "` must not start with a digit or the separator"
+        )
+      )
+      False -> None
+    }
+  })
+  list.flat_map(
+    [float_without_int, separator, markers, prefixes, suffixes],
+    fn(g: List(ConfigError)) { g }
+  )
+}
+
+_strings(c: Config) -> List(ConfigError) {
+  list.flat_map(c.strings, fn(style: StringStyle) {
+    let location = "[strings." + style.name + "]"
+    let style_name: List(ConfigError) = match name.is_valid_module(style.name) && !string.contains(
+      style.name,
+      "/"
+    ) {
+      True -> []
+      False -> [
+        ConfigError(location, "style names must be lowercase snake_case names")
+      ]
+    }
+    let both = style.quote + style.prefix
+    let newlines: List(ConfigError) = match string.contains(both, "\n") || string.contains(
+      both,
+      "\r"
+    ) {
+      True -> [
+        ConfigError(
+          location,
+          "string delimiters and prefixes must not contain line breaks"
+        )
+      ]
+      False -> []
+    }
+    let empty: List(ConfigError) = match style.quote {
+      "" -> [ConfigError(location, "`quote` must not be empty")]
+      _ -> []
+    }
+    let dupes = list.map(
+      list.filter(c.strings, fn(other: StringStyle) {
+        other.name != style.name && other.prefix + other.quote == style.prefix + style.quote && string.compare(
+          other.name,
+          style.name
+        ) == Order.Less
+      }),
+      fn(other: StringStyle) {
+        ConfigError(
+          location,
+          "opens with the same text as [strings." + other.name + "]"
+        )
+      }
+    )
+    list.flat_map(
+      [style_name, newlines, empty, dupes],
+      fn(g: List(ConfigError)) { g }
+    )
+  })
+}
+
+_comments(c: Config) -> List(ConfigError) {
+  let lines: List(#(Option(LineComment), String)) = [
+    #(c.comments.line, "[comments.line]"),
+    #(c.comments.doc, "[comments.doc]"),
+    #(c.comments.module_doc, "[comments.module]")
+  ]
+  let starts = list.filter_map(lines, fn(p: #(Option(LineComment), String)) {
+    match p.0 {
+      Some(comment) if comment.start == "" -> Some(
+        ConfigError(p.1, "`start` must not be empty")
+      )
+      Some(comment) if string.contains(comment.start, "\n") || string.contains(
+        comment.start,
+        "\r"
+      ) -> Some(
+        ConfigError(p.1, "line comment markers must not contain line breaks")
+      )
+      _ -> None
+    }
+  })
+  let block: List(ConfigError) = match c.comments.block {
+    Some(b) if b.start == "" || b.finish == "" -> [
+      ConfigError("[comments.block]", "`start` and `end` must not be empty")
+    ]
+    Some(b) if b.nested && (
+      string.starts_with(b.start, b.finish) || string.starts_with(
+        b.finish,
+        b.start
+      )
+    ) -> [
+      ConfigError(
+        "[comments.block]",
+        "nested comment delimiters must not be prefixes of each other"
+      )
+    ]
+    _ -> []
+  }
+  let dupes = list.map(
+    duplicates(list.map(comment_starts(c), fn(p: #(String, String)) { p.0 })),
+    fn(s: String) {
+      ConfigError(
+        "[comments]",
+        "more than one comment kind starts with `" + s + "`"
+      )
+    }
+  )
+  list.flat_map([starts, block, dupes], fn(g: List(ConfigError)) { g })
+}
+
+_whitespace(c: Config) -> List(ConfigError) {
+  match c.whitespace.items {
+    [] -> [ConfigError("[whitespace]", "`items` must not be empty")]
+    _ -> []
+  }
+}
+
+_paths(c: Config) -> List(ConfigError) {
+  let module_problem: List(ConfigError) = match c.module_name == "" || name.is_valid_module(
+    c.module_name
+  ) {
+    True -> []
+    False -> [
+      ConfigError(
+        "[module]",
+        "name must be a slash-separated lowercase snake_case module path"
+      )
+    ]
+  }
+  let output_problem: List(ConfigError) = match string.trim(c.output_dir) == "" {
+    True -> [ConfigError("[output]", "dir must be a non-empty filesystem path")]
+    False -> []
+  }
+  let parts = list.filter(string.split(c.output_dir, "/"), fn(part) {
+    part != "" && part != "."
+  })
+  let source_prefix = match parts {
+    ["src", ..rest] -> string.join(rest, "/")
+    _ -> ""
+  }
+  let directory_problem = match source_prefix != "" && !name.is_valid_module(
+    source_prefix
+  ) {
+    True -> [
+      ConfigError(
+        "[output]",
+        "directories inside src must be lowercase snake_case module paths"
+      )
+    ]
+    False -> []
+  }
+  list.concat(module_problem, list.concat(output_problem, directory_problem))
+}
+
+_chars(c: Config) -> List(ConfigError) {
+  let opener = match c.chars {
+    Some(QuotedChars(q, _, _)) -> Some(q)
+    Some(PrefixedChars(p, _, _)) -> Some(p)
+    _ -> None
+  }
+  match opener {
+    Some(o) if o == "" || string.contains(o, "\n") || string.contains(o, "\r") -> [
+      ConfigError(
+        "[chars]",
+        "quote or prefix must be non-empty and must not contain line breaks"
+      )
+    ]
+    _ -> []
+  }
+}
+
+_numeric_prefixes(c: Config) -> List(ConfigError) {
+  list.map(duplicates(_prefixes(c)), fn(p: String) {
+    ConfigError("[numbers.prefixes]", "duplicate numeric prefix `" + p + "`")
+  })
+}
+
+// --- helpers -------------------------------------------------------------------------------
+
+/// Items that appear more than once, sorted.
+duplicates(items: List(String)) -> List(String) {
+  list.sort(list.unique(list.filter(items, fn(i: String) {
+    list.length(list.filter(items, fn(j: String) { j == i })) > 1
+  })))
+}
+
+/// Text with line breaks, tabs and backslashes made visible.
+escape(text: String) -> String {
+  text
+  |> string.replace("\\", "\\\\")
+  |> string.replace("\n", "\\n")
+  |> string.replace("\r", "\\r")
+  |> string.replace("\t", "\\t")
+}
