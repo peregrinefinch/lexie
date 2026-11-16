@@ -19,7 +19,11 @@ pooka run -m lexie
 
 `init` creates an ignored `.lexie/lexie.toml`; running lexie writes the generated Pooka modules. In a project called `language`, the generated modules need only the standard library:
 
+After generating the modules, put this in `test/lexer.spec.pooka`:
+
 ```pooka
+module lexer_test
+
 import language/syntax/lexer
 import language/syntax/token
 import poke/should
