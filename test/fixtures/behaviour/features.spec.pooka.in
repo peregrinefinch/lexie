@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module features_test
+
+import features/lexer
+import features/token.{Token}
+import features/location.{Position}
+import poke/should
+import pooka/list
+
+_tokens(source: String) -> List(Token) {
+  list.map(lexer.lex(source), fn(found) { found.token })
+}
+
+test "longer fixed spellings win" {
+  should.equal(_tokens("<= <"), [token.LessEqual(), token.Less(), token.End()])
+}
+
+test "string payloads retain escapes and multiline text" {
+  should.equal(_tokens("\"a\\n\""), [token.Text("a\\n"), token.End()])
+  should.equal(
+    _tokens("\"\"\"a\r\nb\"\"\""),
+    [token.BlockText("a\r\nb"), token.End()]
+  )
+}
+
+test "nested and line comments advance locations without emitting tokens" {
+  let found = lexer.lex("/* a /* b */ c */ let // quiet\r\nlet")
+  should.equal(
+    list.map(found, fn(item) { item.token }),
+    [token.Let(), token.Let(), token.End()]
+  )
+  let second = list.at(found, 1) |> should.be_some()
+  should.equal(second.span.start.line, 2)
+  should.equal(second.span.start.column, 1)
+}
+
+test "integer prefixes preserve their original spelling" {
+  should.equal(
+    _tokens("0xFF 0b101 0o77"),
+    [
+      token.IntLiteral("0xFF"),
+      token.IntLiteral("0b101"),
+      token.IntLiteral("0o77"),
+      token.End()
+    ]
+  )
+}
+
+test "empty input and unexpected Unicode retain exact EOF positions" {
+  let empty = lexer.lex("") |> list.first() |> should.be_some()
+  should.equal(empty.token, token.End())
+  should.equal(empty.span.start, Position(1, 1, 0))
+  should.equal(empty.span.end, Position(1, 1, 0))
+  let found = lexer.lex("🦊")
+  let invalid = list.first(found) |> should.be_some()
+  should.equal(invalid.token, token.Unexpected("🦊"))
+  should.equal(invalid.span.end, Position(1, 2, 4))
+}

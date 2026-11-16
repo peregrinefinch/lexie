@@ -1,10 +1,12 @@
 //// Two small languages, lexed by lexers lexie generated from the
-//// specifications in test/fixtures/specifications. Plain `assert` keeps
-//// the generated project free of test dependencies.
+//// specifications in test/fixtures/specifications. Poke checks the output
+//// in the generated consumer project as well as in Lexie itself.
 
 // SPDX-License-Identifier: Apache-2.0
 
 module languages_test
+
+import poke/should
 
 import calc/highlighter.{Category, Highlight}
 import calc/lexer as calc_lexer
@@ -18,7 +20,7 @@ test "a calculator: numbers with separators, floats with exponents" {
     calc_lexer.lex("answer = (1_000 + 2.5e3) * 3 == 10500"),
     fn(l: calc.Lexeme) { l.token }
   )
-  assert tokens == [
+  should.equal(tokens, [
     calc.Ident("answer"),
     calc.Equal(),
     calc.LeftParen(),
@@ -31,18 +33,18 @@ test "a calculator: numbers with separators, floats with exponents" {
     calc.EqualEqual(),
     calc.IntLiteral("10500"),
     calc.End()
-  ]
+  ])
 }
 
 test "a calculator's highlighter names each piece" {
   let pieces = list.map(highlighter.highlight("1 + x"), fn(h: Highlight) {
     #(h.category, h.text)
   })
-  assert pieces == [
+  should.equal(pieces, [
     #(Category.Number, "1"),
     #(Category.Operator, "+"),
     #(Category.Identifier, "x")
-  ]
+  ])
 }
 
 test "Lisp: symbols full of punctuation, and comments left out" {
@@ -50,7 +52,7 @@ test "Lisp: symbols full of punctuation, and comments left out" {
     lisp_lexer.lex("; squares\n(set-car! pair 'nil?)"),
     fn(l: lisp.Lexeme) { l.token }
   )
-  assert tokens == [
+  should.equal(tokens, [
     lisp.LeftParen(),
     lisp.Symbol("set-car!"),
     lisp.Symbol("pair"),
@@ -58,5 +60,5 @@ test "Lisp: symbols full of punctuation, and comments left out" {
     lisp.Symbol("nil?"),
     lisp.RightParen(),
     lisp.End()
-  ]
+  ])
 }

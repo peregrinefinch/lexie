@@ -1,0 +1,34 @@
+[module]
+name = "features"
+
+[keywords]
+items = ["let"]
+
+[operators]
+items = ["<=", "<"]
+
+[comments.line]
+start = "//"
+emit = false
+
+[comments.block]
+start = "/*"
+end = "*/"
+nested = true
+emit = false
+
+[strings.double]
+quote = '"'
+escapes = true
+token = "Text"
+
+[strings.block]
+quote = '"""'
+escapes = true
+multiline = true
+token = "BlockText"
+
+[numbers.prefixes]
+hex = "0x"
+binary = "0b"
+octal = "0o"

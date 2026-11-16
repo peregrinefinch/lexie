@@ -40,3 +40,14 @@ test "highlighters keep spans even when lex returns plain tokens" {
   should.equal(first.text, "let")
   should.equal(first.span.start, Position(1, 1, 0))
 }
+
+test "keywords keep boundaries and unexpected input does not stop scanning" {
+  should.equal(
+    lexer.lex("letter let"),
+    [token.Ident("letter"), token.Let(), token.End()]
+  )
+  should.equal(
+    lexer.lex("let @ a"),
+    [token.Let(), token.Unexpected("@"), token.Ident("a"), token.End()]
+  )
+}
