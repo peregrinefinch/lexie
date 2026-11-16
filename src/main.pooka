@@ -1,0 +1,442 @@
+//// The lexie command: the part that touches files, so the rest does not have to.
+////
+//// Add lexie as a development dependency and run it through `pooka`:
+////
+//// ```sh
+//// pooka add lexie --dev
+//// pooka run -m lexie init
+//// pooka run -m lexie
+//// ```
+////
+//// It reads the private `.lexie/lexie.toml` specification and writes the generated
+//// modules. A different specification may be selected with `--config`. It
+//// only ever overwrites or removes files that lexie made itself.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module main
+
+import lexie
+import lexie/check
+import lexie/config.{Config, ConfigError}
+import lexie/emit
+import lexie/token.{TokenDef}
+import pooka/env
+import pooka/file
+import pooka/int
+import pooka/io
+import pooka/list
+import pooka/path
+import pooka/process
+import pooka/string
+import tome
+
+/// Run the command named by the arguments, print what happened, and exit
+/// with status 1 if anything went wrong.
+main() {
+  match _command(env.args()) {
+    Ok(message) -> {
+      let _ = io.println(message)
+      Nil
+    }
+    Error(message) -> {
+      let _ = io.eprintln(message)
+      process.exit(1)
+    }
+  }
+}
+
+_usage() -> String {
+  string.join(
+    [
+      "Lexie: a lexer generator for Pooka",
+      "",
+      "Usage: pooka run -m lexie [command] [options]",
+      "",
+      "Commands:",
+      "  init       Create an ignored .lexie/lexie.toml specification",
+      "  generate   Generate the lexer (the default command)",
+      "  check      Check the specification",
+      "  clean      Remove the files lexie generated",
+      "  help       Show this help",
+      "",
+      "Options:",
+      "  --config <path>   Read a standalone specification instead",
+      "  --verbose         With check, list every token class",
+      "  --version         Show the version",
+      "",
+      "The specification is .lexie/lexie.toml unless --config selects another file."
+    ],
+    "\n"
+  )
+}
+
+_version() -> String {
+  "1.0.0"
+}
+
+_command(arguments: List(String)) -> Result(String, String) {
+  match arguments {
+    ["help"] | ["-h"] | ["--help"] -> Ok(_usage())
+    ["--version"] | ["-V"] -> Ok("lexie " + _version())
+    _ -> {
+      let #(rest, config_path) = _config_option(arguments, _default_path(), [])?
+      match rest {
+        [] | ["generate"] -> _generate(config_path)
+        ["init"] -> _init(config_path)
+        ["check"] -> _check(config_path, False)
+        ["check", "--verbose"] -> _check(config_path, True)
+        ["clean"] -> _clean(config_path)
+        _ -> Error(
+          "Unknown command: " + string.join(rest, " ") + "\n\n" + _usage()
+        )
+      }
+    }
+  }
+}
+
+_default_path() -> String {
+  ".lexie/lexie.toml"
+}
+
+_config_option(
+  arguments: List(String),
+  config_path: String,
+  kept: List(String)
+) -> Result(#(List(String), String), String) {
+  match arguments {
+    [] -> Ok(#(list.reverse(kept), config_path))
+    ["--config", given, ..rest] -> _config_option(rest, given, kept)
+    ["--config"] -> Error("--config needs a path.")
+    [argument, ..rest] -> _config_option(
+      rest,
+      config_path,
+      list.prepend(kept, argument)
+    )
+  }
+}
+
+/// Read and check the specification, with every problem in one message.
+_load(config_path: String) -> Result(Config, String) {
+  let text = match file.read(config_path) {
+    Ok(found) -> Ok(found)
+    Error(_) -> Error("Could not read `" + config_path + "`.")
+  }?
+  let #(c, problems) = match lexie.read(text) {
+    Ok(read) -> Ok(read)
+    Error(reason) -> Error("`" + config_path + "`: " + reason)
+  }?
+  match list.concat(problems, check.validate(c)) {
+    [] -> Ok(c)
+    all -> Error(_describe(config_path, all))
+  }
+}
+
+_describe(config_path: String, problems: List(ConfigError)) -> String {
+  config_path + " has " + int.to_string(list.length(problems)) + " configuration error(s):\n" + string.join(
+    list.map(problems, fn(p: ConfigError) {
+      "  " + p.location + ": " + p.message
+    }),
+    "\n"
+  )
+}
+
+_generate(config_path: String) -> Result(String, String) {
+  let c = _load(config_path)?
+  let files = match lexie.generate(c) {
+    Ok(made) -> Ok(made)
+    Error(problems) -> Error(_describe(config_path, problems))
+  }?
+  // Check every destination before writing anything: a file of your own
+  // must never be taken for one lexie made.
+  list.fold(
+    files,
+    Ok(Nil),
+    fn(acc: Result(Nil, String), f: lexie.GeneratedFile) {
+      let _ = acc?
+      _writable(f.path)
+    }
+  )?
+  list.fold(
+    files,
+    Ok(Nil),
+    fn(acc: Result(Nil, String), f: lexie.GeneratedFile) {
+      let _ = acc?
+      let _ = file.create_directories(path.dirname(f.path))
+      match file.write(f.path, f.content) {
+        Ok(_) -> Ok(Nil)
+        Error(_) -> Error("Could not write `" + f.path + "`.")
+      }
+    }
+  )?
+  let written = list.map(files, fn(f: lexie.GeneratedFile) { f.path })
+  let _ = process.run("pooka", list.prepend(written, "format"))
+  let removed = match c.highlighter {
+    True -> ""
+    False -> match _remove(emit.file_path(c, "highlighter.pooka")) {
+      Ok("") -> ""
+      Ok(note) -> note + "\n"
+      Error(_) -> ""
+    }
+  }
+  Ok(
+    string.join(list.map(written, fn(p: String) { "  generated " + p }), "\n") + "\n" + removed + "Done."
+  )
+}
+
+_writable(file_path: String) -> Result(Nil, String) {
+  match _is_symlink(file_path) {
+    True -> Error("Refusing to overwrite the symlink `" + file_path + "`.")
+    False -> match file.read(file_path) {
+      Ok(content) -> match lexie.is_generated(content) {
+        True -> Ok(Nil)
+        False -> Error(
+          "Refusing to overwrite `" + file_path + "`: lexie did not generate it."
+        )
+      }
+      Error(_) -> Ok(Nil)
+    }
+  }
+}
+
+external _Links from erlang "file" {
+  read_link(link: String) -> Result(String, String)
+}
+
+_is_symlink(file_path: String) -> Bool {
+  match _Links.read_link(file_path) {
+    Ok(_) -> True
+    Error(_) -> False
+  }
+}
+
+/// Remove a file, only if lexie generated it.
+_remove(file_path: String) -> Result(String, String) {
+  match _is_symlink(file_path) {
+    True -> Ok("  skipped " + file_path + " (a symlink)")
+    False -> match file.read(file_path) {
+      Error(_) -> Ok("")
+      Ok(content) -> match lexie.is_generated(content) {
+        False -> Ok("  skipped " + file_path + " (not generated by lexie)")
+        True -> match file.delete(file_path) {
+          Ok(_) -> Ok("  deleted " + file_path)
+          Error(_) -> Error("Could not delete `" + file_path + "`.")
+        }
+      }
+    }
+  }
+}
+
+_clean(config_path: String) -> Result(String, String) {
+  let c = _load(config_path)?
+  let notes = list.fold(
+    ["location.pooka", "token.pooka", "lexer.pooka", "highlighter.pooka"],
+    Ok([]),
+    fn(acc: Result(List(String), String), leaf: String) {
+      let done = acc?
+      let note = _remove(emit.file_path(c, leaf))?
+      Ok(list.append(done, note))
+    }
+  )?
+  match list.filter(notes, fn(n: String) { n != "" }) {
+    [] -> Ok("Nothing to remove.")
+    some -> Ok(string.join(some, "\n"))
+  }
+}
+
+_check(config_path: String, verbose: Bool) -> Result(String, String) {
+  let c = _load(config_path)?
+  let details = match verbose {
+    True -> _token_table(c) + "\n"
+    False -> ""
+  }
+  Ok(details + config_path + " is valid.")
+}
+
+/// Keep the project manifest unchanged. The specification is a private input;
+/// the generated Pooka files are the part an application normally commits.
+_init(config_path: String) -> Result(String, String) {
+  let parts = string.split(config_path, "/")
+  match path.basename(config_path) == "pooka.toml" || string.starts_with(
+    config_path,
+    "/"
+  ) || string.contains(config_path, "\\") || string.contains(config_path, ":") || list.any(
+    parts,
+    fn(part) { part == ".." || part == "" }
+  ) {
+    True -> Error(
+      "Choose a project-relative specification file, such as .lexie/lexie.toml."
+    )
+    False -> {
+      match file.exists(config_path) {
+        Error(_) -> Error("Could not inspect `" + config_path + "`.")
+        Ok(True) -> Error("`" + config_path + "` already exists.")
+        Ok(False) -> {
+          match _is_symlink(config_path) {
+            True -> Error(
+              "Refusing to overwrite the symlink `" + config_path + "`."
+            )
+            False -> {
+              let _ = _file_action(
+                file.create_directories(path.dirname(config_path)),
+                "create specification directory"
+              )?
+              _ignore_config(config_path)?
+              let project = match file.read("pooka.toml") {
+                Ok(text) -> _project_name(text)
+                Error(_) -> "language"
+              }
+              _file_action(
+                file.write(
+                  config_path,
+                  string.join(_starter(project + "/syntax"), "\n") + "\n"
+                ),
+                "write specification"
+              )?
+              Ok(
+                "Created " + config_path + ".\nThe specification is ignored by Git.\nRun `pooka run -m lexie` to generate the lexer."
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+_file_action(value: Result(Nil, file.FileError), action: String) -> Result(
+  Nil,
+  String
+) {
+  match value {
+    Ok(_) -> Ok(Nil)
+    Error(problem) -> Error("Could not " + action + ": " + problem.message)
+  }
+}
+
+// Ignore just this input, rather than hiding unrelated project files.
+_ignore_config(config_path: String) -> Result(Nil, String) {
+  match _is_symlink(".gitignore") {
+    True -> Error("Refusing to update a symlinked .gitignore.")
+    False -> {
+      let previous = match file.exists(".gitignore") {
+        Ok(False) -> Ok("")
+        Ok(True) -> file.read(".gitignore") |> _read_action()
+        Error(_) -> Error("Could not inspect .gitignore.")
+      }?
+      let pattern = match string.starts_with(config_path, ".lexie/") {
+        True -> "/.lexie/"
+        False -> "/" + _git_pattern(config_path)
+      }
+      match list.contains(string.split(previous, "\n"), pattern) {
+        True -> Ok(Nil)
+        False -> {
+          let gap = match previous == "" || string.ends_with(previous, "\n") {
+            True -> ""
+            False -> "\n"
+          }
+          file.write(".gitignore", previous + gap + pattern + "\n") |> _file_action(
+            "update .gitignore"
+          )
+        }
+      }
+    }
+  }
+}
+
+_read_action(value: Result(String, file.FileError)) -> Result(String, String) {
+  match value {
+    Ok(text) -> Ok(text)
+    Error(problem) -> Error("Could not read .gitignore: " + problem.message)
+  }
+}
+
+_git_pattern(text: String) -> String {
+  list.fold(["*", "?", "[", "]", "!", "#", " "], text, fn(value, character) {
+    string.replace(value, character, "\\" + character)
+  })
+}
+
+/// Every token class lexie will generate, one per line: its name, whether
+/// it carries text, and where it comes from.
+_token_table(c: Config) -> String {
+  let defs = token.definitions(c)
+  let width = list.fold(defs, 0, fn(widest: Int, d: TokenDef) {
+    int.max(widest, string.length(d.name))
+  })
+  let rows = list.map(defs, fn(d: TokenDef) {
+    let carries = match d.payload {
+      True -> "(text)  "
+      False -> "        "
+    }
+    "  " + string.pad_end(d.name, width, " ") + "  " + carries + token.describe(
+      d.kind
+    )
+  })
+  string.join(
+    list.prepend(rows, int.to_string(list.length(defs)) + " token classes:"),
+    "\n"
+  )
+}
+
+_project_name(text: String) -> String {
+  match tome.parse(text) {
+    Ok(document) -> match tome.path(document, ["name"]) {
+      Some(value) -> match tome.as_string(value) {
+        Some(name) -> name
+        None -> "language"
+      }
+      None -> "language"
+    }
+    Error(_) -> "language"
+  }
+}
+
+_starter(module_name: String) -> List(String) {
+  [
+    "# Lexie lexer specification. Run `pooka run -m lexie` to generate the lexer.",
+    "",
+    "location-info = true",
+    "",
+    "[output]",
+    "# Generated files belong in source control; this specification does not.",
+    "dir = \"src\"",
+    "",
+    "[module]",
+    "# Generated modules go in src/<name>/. Leave it out to use src/ itself.",
+    "name = \"" + module_name + "\"",
+    "",
+    "[highlighter]",
+    "enabled = false",
+    "",
+    "[keywords]",
+    "items = [\"if\", \"else\", \"fn\", \"let\", \"return\"]",
+    "",
+    "[literals]",
+    "items = [\"true\", \"false\"]",
+    "",
+    "[operators]",
+    "items = [\"==\", \"!=\", \"<=\", \">=\", \"=\", \"+\", \"-\", \"*\", \"/\", \"<\", \">\"]",
+    "",
+    "[punctuation]",
+    "items = [\"(\", \")\", \"{\", \"}\", \"[\", \"]\", \",\", \";\", \":\", \".\"]",
+    "",
+    "[identifier]",
+    "start = [\"a-z\", \"A-Z\", \"_\"]",
+    "continue = [\"a-z\", \"A-Z\", \"0-9\", \"_\"]",
+    "",
+    "[comments.line]",
+    "start = \"//\"",
+    "emit = false",
+    "",
+    "[strings.double]",
+    "quote = \"\\\"\"",
+    "escapes = true",
+    "",
+    "[numbers.int]",
+    "separator = \"_\"",
+    "",
+    "[numbers.float]",
+    "exponent = [\"e\", \"E\"]"
+  ]
+}

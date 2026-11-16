@@ -1,0 +1,241 @@
+//// The whole journey, the way a person takes it: a fresh project adds lexie
+//// as a development dependency and drives it with `pooka run -m lexie`.
+////
+//// One temporary project, through `poke/fixture`, runs `init`, `check` and
+//// `generate`, generates a lexer from every specification in
+//// `test/fixtures/specifications`, then runs `pooka test` there with the
+//// specs in `test/fixtures/behaviour`. So the generated code is compiled
+//// and exercised, not just written. It needs `pooka` on the PATH and
+//// network access for Hex, like any other build.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module end_to_end_test
+
+import poke/fixture
+import poke/should
+
+import pooka/env
+import pooka/file
+import pooka/list
+import pooka/path
+import pooka/process.{Output}
+import pooka/string
+
+/// Run a command in a folder; any failure to start it at all fails the test.
+///
+/// The commands inherit this test's colour setting, and a coloured report
+/// wraps names in escape codes that text checks cannot see past. So they
+/// always run without colour, whatever terminal started the tests.
+_run(command: String, args: List(String), folder: String) -> Output {
+  let _ = should.be_ok(env.set("NO_COLOR", "1"))
+  let output = should.be_ok(process.run_in(command, args, folder))
+  output
+}
+
+/// Run `pooka` in a folder and insist that it succeeds.
+_pooka(args: List(String), folder: String) -> String {
+  let output = _run("pooka", args, folder)
+  let said = output.stdout + output.stderr
+  should.equal_named(
+    output.status,
+    0,
+    "pooka " + string.join(args, " ") + " failed:\n" + said
+  )
+  said
+}
+
+/// Run lexie in the project, through `pooka run -m lexie`.
+_lexie(args: List(String), project: String) -> Output {
+  _run("pooka", list.concat(["run", "-m", "lexie"], args), project)
+}
+
+/// Everything a command printed. Check this rather than one stream: which
+/// of stdout and stderr `pooka` uses for a report is not part of its promise.
+_said(output: Output) -> String {
+  output.stdout + output.stderr
+}
+
+_copy(from: String, to: String) -> Nil {
+  let text = should.be_ok(file.read(from))
+  let _ = should.be_ok(file.write(to, text))
+  Nil
+}
+
+/// A fresh project with lexie as a development dependency.
+_project(here: String, directory: String) -> String {
+  let root = path.join([here, directory])
+  let _ = should.be_ok(file.create_directories(root))
+  let _ = _pooka(["new", "demo"], root)
+  let project = path.join([root, "demo"])
+  let _ = _pooka(["add", "lexie", "--dev", "--path", here], project)
+  let manifest_path = path.join([project, "pooka.toml"])
+  let manifest = should.be_ok(file.read(manifest_path))
+  should.contain_text(manifest, "[dev-dependencies]")
+  should.be_ok(
+    file.write(
+      manifest_path,
+      string.replace(
+        manifest,
+        "[dev-dependencies]",
+        "[dev-dependencies]\npoke = \">= 1.0.0 and < 2.0.0\""
+      )
+    )
+  )
+  should.be_ok(file.delete(path.join([project, "test", "main.spec.pooka"])))
+  project
+}
+
+/// One project for the whole journey: each `pooka` command starts a VM and
+/// may ask Hex for something, so they are worth sharing.
+test "a project adds lexie, generates lexers that pass their tests, and is kept safe" {
+  let here = should.be_ok(env.current_directory())
+  fixture.with_directory(fn(directory) {
+    let project = _project(here, directory)
+
+    // init creates a private specification once; the project manifest stays unchanged.
+    let manifest_path = path.join([project, "pooka.toml"])
+    let original_manifest = should.be_ok(file.read(manifest_path))
+    let init = _lexie(["init"], project)
+    should.equal_named(init.status, 0, _said(init))
+    should.equal_named(
+      string.contains(_said(init), "Created .lexie/lexie.toml."),
+      True,
+      _said(init)
+    )
+    should.equal(file.read(manifest_path), Ok(original_manifest))
+    let specification_path = path.join([project, ".lexie", "lexie.toml"])
+    let specification = should.be_ok(file.read(specification_path))
+    should.contain_text(specification, "[keywords]")
+    should.contain_text(
+      should.be_ok(file.read(path.join([project, ".gitignore"]))),
+      "/.lexie/"
+    )
+    let _ = _run("git", ["init", "--quiet"], project)
+    let ignored = _run("git", ["check-ignore", ".lexie/lexie.toml"], project)
+    should.equal_named(ignored.status, 0, _said(ignored))
+    // Nested output directories must be reflected in generated import paths.
+    should.be_ok(
+      file.write(
+        specification_path,
+        string.replace(
+          specification,
+          "dir = \"src\"",
+          "dir = \"src/generated\""
+        )
+      )
+    )
+    let again = _lexie(["init"], project)
+    should.equal_named(
+      again.status,
+      1,
+      "a second init must refuse: " + _said(again)
+    )
+
+    // check reads it back, and --verbose lists the token classes.
+    let check = _lexie(["check", "--verbose"], project)
+    should.equal_named(check.status, 0, _said(check))
+    loop expected in [
+      "token classes:",
+      "TrueLiteral",
+      ".lexie/lexie.toml is valid."
+    ] {
+      should.equal_named(
+        string.contains(_said(check), expected),
+        True,
+        expected + " missing from:\n" + _said(check)
+      )
+    }
+
+    // A file of your own where the lexer would go is left alone.
+    let folder = path.join([project, "src", "generated", "demo", "syntax"])
+    let _ = should.be_ok(file.create_directories(folder))
+    let mine = path.join([folder, "lexer.pooka"])
+    let _ = should.be_ok(file.write(mine, "module lexer\n"))
+    let refused = _lexie([], project)
+    should.equal_named(refused.status, 1, _said(refused))
+    should.equal_named(
+      string.contains(_said(refused), "lexie did not generate it"),
+      True,
+      _said(refused)
+    )
+    should.equal(file.read(mine), Ok("module lexer\n"))
+    let _ = should.be_ok(file.delete(mine))
+
+    // With no command, lexie generates.
+    let generate = _lexie([], project)
+    should.equal_named(generate.status, 0, _said(generate))
+    loop leaf in ["location", "token", "lexer"] {
+      let written = path.join([folder, leaf + ".pooka"])
+      let content = should.be_ok(file.read(written))
+      should.equal_named(
+        string.starts_with(
+          content,
+          "//// Code generated by lexie. DO NOT EDIT."
+        ),
+        True,
+        written
+      )
+    }
+
+    // Every fixture specification, through --config.
+    let specifications = path.join([here, "test", "fixtures", "specifications"])
+    let names = should.be_ok(file.list_directory(specifications))
+    loop name in list.sort_by(names, string.compare) {
+      _copy(path.join([specifications, name]), path.join([project, name]))
+      let made = _lexie(["--config", name], project)
+      should.equal_named(made.status, 0, name + ": " + _said(made))
+    }
+
+    // The generated lexers are formatted, compile, and behave.
+    let behaviour = path.join([here, "test", "fixtures", "behaviour"])
+    let specs = list.filter(
+      should.be_ok(file.list_directory(behaviour)),
+      fn(name) { string.ends_with(name, ".spec.pooka.in") }
+    )
+    loop spec in specs {
+      _copy(
+        path.join([behaviour, spec]),
+        path.join(
+          [project, "test", string.drop_end(spec, string.length(".in"))]
+        )
+      )
+    }
+    let _ = _pooka(["format", "--check"], project)
+    let tested = _run("pooka", ["test"], project)
+    should.equal_named(tested.status, 0, _said(tested))
+    should.equal_named(
+      !string.contains(_said(tested), "warning"),
+      True,
+      _said(tested)
+    )
+    loop spec in specs {
+      let heading = "test module: " + string.drop_end(
+        spec,
+        string.length(".spec.pooka.in")
+      ) + "_test"
+      should.equal_named(
+        string.contains(_said(tested), heading),
+        True,
+        heading + " did not run:\n" + _said(tested)
+      )
+    }
+
+    // clean removes what lexie wrote for the project's own specification,
+    // and says so.
+    let clean = _lexie(["clean"], project)
+    should.equal_named(clean.status, 0, _said(clean))
+    should.equal_named(
+      string.contains(_said(clean), "deleted"),
+      True,
+      _said(clean)
+    )
+    should.equal(file.exists(path.join([folder, "lexer.pooka"])), Ok(False))
+    let nothing = _lexie(["clean"], project)
+    should.equal_named(
+      string.contains(_said(nothing), "Nothing to remove."),
+      True,
+      _said(nothing)
+    )
+  })
+}

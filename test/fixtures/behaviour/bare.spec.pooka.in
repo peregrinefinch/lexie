@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module bare_test
+
+import bare/lexer
+import bare/token
+import bare/location.{Location, Position}
+import bare/highlighter
+import poke/should
+import pooka/list
+
+test "location-info false returns plain tokens" {
+  should.equal(
+    lexer.lex("let a = 1"),
+    [
+      token.Let(),
+      token.Ident("a"),
+      token.Equal(),
+      token.IntLiteral("1"),
+      token.End()
+    ]
+  )
+}
+
+test "explicit locations retain Unicode byte ranges and line breaks" {
+  let found = lexer.lex_with_locations("let\r\né")
+  should.equal(list.length(found), 3)
+  let word = should.be_some(list.at(found, 1))
+  should.equal(word.span.start, Position(2, 1, 5))
+  should.equal(word.span.end, Position(2, 2, 7))
+  should.equal(word.span.byte_length(), 2)
+  should.equal(word.span.start.format(), "2:1")
+  should.equal(Location("input.tiny", word.span).format(), "input.tiny:2:1")
+}
+
+test "highlighters keep spans even when lex returns plain tokens" {
+  let found = highlighter.highlight("let a")
+  should.equal(list.length(found), 2)
+  let first = should.be_some(list.first(found))
+  should.equal(first.text, "let")
+  should.equal(first.span.start, Position(1, 1, 0))
+}

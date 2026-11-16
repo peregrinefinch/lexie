@@ -1,0 +1,62 @@
+//// Two small languages, lexed by lexers lexie generated from the
+//// specifications in test/fixtures/specifications. Plain `assert` keeps
+//// the generated project free of test dependencies.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module languages_test
+
+import calc/highlighter.{Category, Highlight}
+import calc/lexer as calc_lexer
+import calc/token as calc
+import lisp/lexer as lisp_lexer
+import lisp/token as lisp
+import pooka/list
+
+test "a calculator: numbers with separators, floats with exponents" {
+  let tokens = list.map(
+    calc_lexer.lex("answer = (1_000 + 2.5e3) * 3 == 10500"),
+    fn(l: calc.Lexeme) { l.token }
+  )
+  assert tokens == [
+    calc.Ident("answer"),
+    calc.Equal(),
+    calc.LeftParen(),
+    calc.IntLiteral("1_000"),
+    calc.Plus(),
+    calc.FloatLiteral("2.5e3"),
+    calc.RightParen(),
+    calc.Star(),
+    calc.IntLiteral("3"),
+    calc.EqualEqual(),
+    calc.IntLiteral("10500"),
+    calc.End()
+  ]
+}
+
+test "a calculator's highlighter names each piece" {
+  let pieces = list.map(highlighter.highlight("1 + x"), fn(h: Highlight) {
+    #(h.category, h.text)
+  })
+  assert pieces == [
+    #(Category.Number, "1"),
+    #(Category.Operator, "+"),
+    #(Category.Identifier, "x")
+  ]
+}
+
+test "Lisp: symbols full of punctuation, and comments left out" {
+  let tokens = list.map(
+    lisp_lexer.lex("; squares\n(set-car! pair 'nil?)"),
+    fn(l: lisp.Lexeme) { l.token }
+  )
+  assert tokens == [
+    lisp.LeftParen(),
+    lisp.Symbol("set-car!"),
+    lisp.Symbol("pair"),
+    lisp.Quote(),
+    lisp.Symbol("nil?"),
+    lisp.RightParen(),
+    lisp.End()
+  ]
+}
