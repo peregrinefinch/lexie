@@ -1,0 +1,128 @@
+//// Colouring in, without choosing the crayons.
+////
+//// Generates the optional `highlighter.pooka`: each token's highlight
+//// category, the text it covers, and its span. No HTML or colours; just
+//// the categories, for any renderer to use.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module generate_highlighter
+
+import lexie/config.{Config}
+import lexie/emit
+import lexie/token.{TokenDef}
+import pooka/list
+import pooka/string
+
+/// The source of `highlighter.pooka` for a specification.
+source(c: Config) -> String {
+  let definitions = token.definitions(c)
+  let order = list.unique(list.map(definitions, fn(d: TokenDef) {
+    category(d.kind)
+  }))
+  let arms = list.map(order, fn(cat: String) {
+    let patterns = list.map(
+      list.filter(definitions, fn(d: TokenDef) { category(d.kind) == cat }),
+      fn(d: TokenDef) {
+        match d.payload {
+          True -> "token." + d.name + "(_)"
+          False -> "token." + d.name
+        }
+      }
+    )
+    "    " + string.join(patterns, " | ") + " -> Category." + cat
+  })
+  emit.lines(
+    list.concat(
+      [
+        emit.header("Semantic highlighting for the generated lexer."),
+        "module highlighter",
+        "",
+        "import " + emit.module_path(c, "lexer"),
+        "import " + emit.module_path(c, "location") + ".{Span}",
+        "import " + emit.module_path(c, "token") + ".{Lexeme, Token}",
+        "import pooka/bit_array",
+        "import pooka/list",
+        "",
+        "/// What kind of thing a token is, for colouring it.",
+        "enum Category {",
+        "  Keyword,",
+        "  Literal,",
+        "  Identifier,",
+        "  Number,",
+        "  String,",
+        "  Character,",
+        "  Comment,",
+        "  Operator,",
+        "  Punctuation,",
+        "  Whitespace,",
+        "  Invalid,",
+        "  Plain",
+        "}",
+        "",
+        "/// A token's category, the source text it covers, and where it is.",
+        "class Highlight(category: Category, text: String, span: Span)",
+        "",
+        "/// Lex source code into highlights. The end-of-file token is left out,",
+        "/// as is input the lexer skips, such as whitespace; the spans show the",
+        "/// gaps.",
+        "highlight(source: String) -> List(Highlight) {",
+        "  highlight_lexemes(source, lexer.lex_with_locations(source))",
+        "}",
+        "",
+        "/// Highlights for lexemes already lexed from `source`.",
+        "highlight_lexemes(source: String, lexemes: List(Lexeme)) -> List(Highlight) {",
+        "  list.filter_map(lexemes, fn(lexeme: Lexeme) {",
+        "    match lexeme.token {",
+        "      token.End -> None",
+        "      found -> {",
+        "        let from = lexeme.span.start.byte_offset",
+        "        let size = lexeme.span.end.byte_offset - from",
+        "        Some(Highlight(category(found), _slice(source, from, size), lexeme.span))",
+        "      }",
+        "    }",
+        "  })",
+        "}",
+        "",
+        "/// A token's highlight category.",
+        "category(found: Token) -> Category {",
+        "  match found {"
+      ],
+      list.concat(arms, [
+        "  }",
+        "}",
+        "",
+        "/// Bytes of the source, as text. A span that does not fit gives nothing,",
+        "/// rather than a crash.",
+        "_slice(source: String, from: Int, size: Int) -> String {",
+        "  match bit_array.slice(bit_array.from_string(source), from, size) {",
+        "    Ok(part) -> match bit_array.to_string(part) {",
+        "      Ok(text) -> text",
+        "      Error(_) -> \"\"",
+        "    }",
+        "    Error(_) -> \"\"",
+        "  }",
+        "}",
+        ""
+      ])
+    )
+  )
+}
+
+/// The highlight category of a kind of token.
+category(kind: token.Kind) -> String {
+  match kind {
+    token.Keyword(_) -> "Keyword"
+    token.Literal(_) -> "Literal"
+    token.Operator(_) -> "Operator"
+    token.Punctuation(_) -> "Punctuation"
+    token.IdentKind -> "Identifier"
+    token.IntKind | token.FloatKind -> "Number"
+    token.StringKind -> "String"
+    token.CharKind -> "Character"
+    token.CommentKind | token.DocCommentKind | token.ModuleCommentKind | token.BlockCommentKind -> "Comment"
+    token.WhitespaceKind -> "Whitespace"
+    token.ErrorKind -> "Invalid"
+    token.EndKind -> "Plain"
+  }
+}

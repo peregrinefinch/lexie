@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Names and generated files should keep their promises for more than a few
+//// chosen spellings. Seeds make a surprise repeatable; snapshots make a change
+//// in the generated source something a person can inspect before accepting.
+module properties_test
+
+import lexie
+import lexie/config.{Config}
+import lexie/emit
+import lexie/name
+import poke/generator
+import poke/property
+import poke/should
+import poke/snapshot
+import pooka/file
+import pooka/list
+import pooka/path
+import pooka/string
+
+_config(text: String) -> Config {
+  let #(found, problems) = should.be_ok(lexie.read(text))
+  should.equal(problems, [])
+  found
+}
+
+_word() -> generator.Generator(#(String, String)) {
+  generator.pair(
+    generator.elements(["a", "b", "c"]),
+    generator.strings(["a", "b", "c", "_", "0", "9"], 20)
+  )
+}
+
+test "property: identifier spellings derive valid deterministic class names" {
+  property.for_all(_word(), fn(parts) {
+    let word = parts.0 + parts.1
+    let derived = name.derive(word) |> should.be_ok()
+    should.be_true(name.is_valid_class(derived))
+    should.equal(name.derive(word), Ok(derived))
+  })
+}
+
+test "property: keyword generation is deterministic and keeps valid output paths" {
+  property.for_all_with(
+    _word(),
+    fn(parts) {
+      let word = parts.0 + parts.1
+      let specification = _config(
+        "[keywords]\nitems = [" + emit.literal(word) + "]"
+      )
+      let first = lexie.generate(specification) |> should.be_ok()
+      should.equal(lexie.generate(specification), Ok(first))
+      should.equal(list.map(first, fn(file) { file.path }), [
+        "src/location.pooka",
+        "src/token.pooka",
+        "src/lexer.pooka"
+      ])
+      should.be_true(list.all(first, fn(file) {
+        lexie.is_generated(file.content)
+      }))
+    },
+    property.Config(2026, 30, 12, 50)
+  )
+}
+
+_calculator(leaf: String) -> String {
+  let text = file.read("test/fixtures/specifications/calculator.toml") |> should.be_ok()
+  let files = lexie.generate(_config(text)) |> should.be_ok()
+  should.equal(list.length(files), 4)
+  let generated = list.find(files, fn(file) { path.stem(file.path) == leaf }) |> should.be_some()
+  generated.content
+}
+
+test "snapshot: generated calculator locations" {
+  snapshot.snap(_calculator("location"), "calculator-location")
+}
+
+test "snapshot: generated calculator token classes" {
+  snapshot.snap(_calculator("token"), "calculator-token")
+}
+
+test "snapshot: generated calculator lexer" {
+  snapshot.snap(_calculator("lexer"), "calculator-lexer")
+}
+
+test "snapshot: generated calculator highlighter" {
+  snapshot.snap(_calculator("highlighter"), "calculator-highlighter")
+}
+
+test "guide TOML examples use supported settings" {
+  let text = file.read("docs/guide.md") |> should.be_ok()
+  let examples = string.split(text, "```toml\n") |> list.drop(1)
+  should.be_true(list.length(examples) > 0)
+  list.each(examples, fn(part) {
+    let source = string.split(part, "```") |> list.first() |> should.be_some()
+    let #(_, problems) = lexie.read(source) |> should.be_ok()
+    should.equal_named(problems, [], "guide example:\n" + source)
+  })
+}

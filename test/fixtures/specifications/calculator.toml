@@ -1,0 +1,12 @@
+[module]
+name = "calc"
+[highlighter]
+enabled = true
+[operators]
+items = ["+", "-", "*", "/", "=", "=="]
+[punctuation]
+items = ["(", ")"]
+[numbers.int]
+separator = "_"
+[numbers.float]
+exponent = ["e", "E"]

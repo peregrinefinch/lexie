@@ -1,0 +1,937 @@
+//// The reader itself: one patient walk over the bytes, and not a regular
+//// expression in sight.
+////
+//// Generates `lexer.pooka`: a hand-written-style lexer over the source's
+//// bytes.
+////
+//// Fixed tokens match with bit-array literals, such as
+//// `<<"==":utf8, after:bits>>`, tried longest first. Character classes
+//// match one byte against ranges in a guard. Text is sliced out of the
+//// source by byte offset, so nothing is copied until a token keeps it. There
+//// is no regular expression engine and no runtime library: the generated
+//// module needs only the standard library.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module generate_lexer
+
+import lexie/config.{BlockComment, Config, LineComment, PrefixedChars, QuotedChars, StringStyle}
+import lexie/emit
+import lexie/name
+import lexie/token
+import pooka/int
+import pooka/list
+import pooka/string
+
+/// The generated lexer module.
+source(c: Config) -> String {
+  let body = list.flat_map(
+    [_lex(c), _loop(c), _keyword_fn(c), _scanners(c), _prefixed_char_fn(c)],
+    fn(part: List(String)) { part }
+  )
+  let text = emit.lines(body)
+  let helpers = _used_helpers(c, text)
+  let everything = emit.lines(
+    list.concat(body, list.map(helpers, fn(h: #(String, List(String))) {
+      emit.lines(h.1)
+    }))
+  )
+  let imports = list.filter_map(
+    [
+      #("bit_array.", "import pooka/bit_array"),
+      #("list.", "import pooka/list"),
+      #("string.", "import pooka/string")
+    ],
+    fn(i: #(String, String)) {
+      match string.contains(everything, i.0) {
+        True -> Some(i.1)
+        False -> None
+      }
+    }
+  )
+  emit.lines(
+    list.concat(
+      [
+        emit.header("A generated lexer for your language."),
+        "module lexer",
+        ""
+      ],
+      list.concat(
+        imports,
+        [
+          "import " + emit.module_path(c, "location") + ".{Position, Span}",
+          "import " + emit.module_path(c, "token") + ".{Lexeme, Token}",
+          "",
+          everything
+        ]
+      )
+    )
+  )
+}
+
+_lex(c: Config) -> List(String) {
+  let result = match c.location_info {
+    True -> "Lexeme"
+    False -> "Token"
+  }
+  let expression = match c.location_info {
+    True -> "lex_with_locations(source)"
+    False -> "list.map(lex_with_locations(source), fn(found: Lexeme) { found.token })"
+  }
+  [
+    "/// Lex source text. The last item is always the end-of-file token.",
+    "lex(source: String) -> List(" + result + ") {",
+    "  " + expression,
+    "}",
+    "",
+    "/// Located lexemes, independent of the location-info configuration.",
+    "lex_with_locations(source: String) -> List(Lexeme) {",
+    "  _loop(source, bit_array.from_string(source), location.start(), [])",
+    "}",
+    ""
+  ]
+}
+
+// --- the main loop ------------------------------------------------------------------------
+
+_loop(c: Config) -> List(String) {
+  let arms = list.flat_map(
+    [_fixed_arms(c), _number_arm(c), _ident_arm(c)],
+    fn(part: List(String)) { part }
+  )
+  list.concat(
+    [
+      "_loop(source: String, rest: BitArray, pos: Position, acc: List(Lexeme)) -> List(Lexeme) {",
+      "  match rest {",
+      "    <<>> -> _done(pos, acc)"
+    ],
+    list.concat(arms, [
+      "    _ -> _unexpected(source, rest, pos, acc)",
+      "  }",
+      "}",
+      ""
+    ])
+  )
+}
+
+/// Every token that starts with a fixed piece of text, longest first.
+_fixed_arms(c: Config) -> List(String) {
+  let whitespace = list.map(c.whitespace.items, fn(item: String) {
+    #(item, _whitespace_arm(c, item))
+  })
+  let lines: List(Option(LineComment)) = [
+    c.comments.line,
+    c.comments.doc,
+    c.comments.module_doc
+  ]
+  let comments = list.filter_map(lines, fn(comment: Option(LineComment)) {
+    match comment {
+      Some(found) -> Some(#(found.start, _line_comment_arm(found)))
+      None -> None
+    }
+  })
+  let block = match c.comments.block {
+    Some(b) -> [#(b.start, _block_comment_arm(c, b))]
+    None -> []
+  }
+  let strings = list.map(c.strings, fn(s: StringStyle) {
+    #(s.prefix + s.quote, _string_arm(c, s))
+  })
+  let chars = match c.chars {
+    Some(QuotedChars(quote, _, t)) -> [#(quote, _quoted_char_arm(c, quote, t))]
+    Some(PrefixedChars(prefix, _, _)) -> [#(prefix, [
+      "    " + emit.starts_with(prefix, "after") + " -> _prefixed_char(source, after, pos, acc)"
+    ])]
+    _ -> []
+  }
+  let prefixes = match c.numbers.int_enabled {
+    False -> []
+    True -> list.filter_map(
+      [
+        #(c.numbers.hex_prefix, "_scan_hex_digits"),
+        #(c.numbers.binary_prefix, "_scan_binary_digits"),
+        #(c.numbers.octal_prefix, "_scan_octal_digits")
+      ],
+      fn(p: #(Option(String), String)) {
+        match p.0 {
+          Some(prefix) -> Some(#(prefix, _prefixed_number_arm(c, prefix, p.1)))
+          None -> None
+        }
+      }
+    )
+  }
+  let symbols = list.map(
+    list.concat(c.operators, c.punctuation),
+    fn(t: String) {
+      #(t, _symbol_arm(c, t))
+    }
+  )
+  let all = list.flat_map(
+    [whitespace, comments, block, strings, chars, prefixes, symbols],
+    fn(group: List(#(String, List(String)))) { group }
+  )
+  list.flat_map(emit.longest_first(all), fn(pair: #(String, List(String))) {
+    pair.1
+  })
+}
+
+/// Where the position goes after a fixed piece of text.
+_after_fixed(text: String) -> String {
+  match text {
+    "\n" | "\r" | "\r\n" -> "_next_line(pos, " + int.to_string(emit.bytes(text)) + ")"
+    _ -> match string.contains(text, "\n") || string.contains(text, "\r") {
+      True -> "_advance_text(pos, " + emit.literal(text) + ")"
+      False -> "_advance(pos, " + int.to_string(emit.columns(text)) + ", " + int.to_string(
+        emit.bytes(text)
+      ) + ")"
+    }
+  }
+}
+
+_whitespace_arm(c: Config, item: String) -> List(String) {
+  let pattern = "    " + emit.starts_with(item, "after") + " -> "
+  match c.whitespace.emit {
+    False -> [pattern + "_loop(source, after, " + _after_fixed(item) + ", acc)"]
+    True -> [
+      pattern + "_push(source, after, acc, token." + c.whitespace.token + "(" + emit.literal(
+        item
+      ) + "), pos, " + _after_fixed(item) + ")"
+    ]
+  }
+}
+
+_symbol_arm(c: Config, text: String) -> List(String) {
+  [
+    "    " + emit.starts_with(text, "after") + " -> _push(source, after, acc, token." + token.symbol_name(
+      c,
+      text
+    ) + "(), pos, " + _after_fixed(text) + ")"
+  ]
+}
+
+_line_comment_arm(comment: LineComment) -> List(String) {
+  let open = int.to_string(emit.bytes(comment.start))
+  let finish = match comment.emit {
+    True -> "      _push(source, after, acc, token." + comment.token + "(_inside(source, pos, size, " + open + ", 0)), pos, end)"
+    False -> "      _loop(source, after, end, acc)"
+  }
+  [
+    "    " + emit.starts_with(comment.start, "after") + " -> {",
+    "      let #(after, size) = _scan_line(after, " + open + ")",
+    "      let end = _advance(pos, string.length(_slice(source, pos.byte_offset, size)), size)",
+    finish,
+    "    }"
+  ]
+}
+
+_block_comment_arm(c: Config, block: BlockComment) -> List(String) {
+  let open = int.to_string(emit.bytes(block.start))
+  let close = int.to_string(emit.bytes(block.finish))
+  let closed = match block.emit {
+    True -> "        True -> _push(source, after, acc, token." + block.token + "(_inside(source, pos, size, " + open + ", " + close + ")), pos, end)"
+    False -> "        True -> _loop(source, after, end, acc)"
+  }
+  [
+    "    " + emit.starts_with(block.start, "after") + " -> {",
+    "      let #(after, size, ended) = _scan_block_comment(after, " + open + ", 1)",
+    "      let text = _slice(source, pos.byte_offset, size)",
+    "      let end = _advance_text(pos, text)",
+    "      match ended {",
+    closed,
+    "        False -> _push(source, after, acc, token." + c.error_token + "(text), pos, end)",
+    "      }",
+    "    }"
+  ]
+}
+
+_string_arm(c: Config, style: StringStyle) -> List(String) {
+  let opener = style.prefix + style.quote
+  let open = int.to_string(emit.bytes(opener))
+  let close = int.to_string(emit.bytes(style.quote))
+  let end = match style.multiline {
+    True -> "_advance_text(pos, text)"
+    False -> "_advance(pos, string.length(text), size)"
+  }
+  [
+    "    " + emit.starts_with(opener, "after") + " -> {",
+    "      let #(after, size, ended) = " + scanner_name(style) + "(after, " + open + ")",
+    "      let text = _slice(source, pos.byte_offset, size)",
+    "      let end = " + end,
+    "      match ended {",
+    "        True -> _push(source, after, acc, token." + style.token + "(_inside(source, pos, size, " + open + ", " + close + ")), pos, end)",
+    "        False -> _push(source, after, acc, token." + c.error_token + "(text), pos, end)",
+    "      }",
+    "    }"
+  ]
+}
+
+_quoted_char_arm(c: Config, quote: String, name_of_token: String) -> List(
+  String
+) {
+  let size_of_quote = int.to_string(emit.bytes(quote))
+  [
+    "    " + emit.starts_with(quote, "after") + " -> {",
+    "      let #(after, size, ended) = _scan_char(after, " + size_of_quote + ")",
+    "      let text = _slice(source, pos.byte_offset, size)",
+    "      let end = _advance(pos, string.length(text), size)",
+    "      match ended {",
+    "        True -> _push(source, after, acc, token." + name_of_token + "(_inside(source, pos, size, " + size_of_quote + ", " + size_of_quote + ")), pos, end)",
+    "        False -> _push(source, after, acc, token." + c.error_token + "(text), pos, end)",
+    "      }",
+    "    }"
+  ]
+}
+
+_prefixed_number_arm(c: Config, prefix: String, scanner: String) -> List(String) {
+  let suffix = match c.numbers.suffixes {
+    [] -> []
+    _ -> ["      let #(after, size) = _scan_number_suffix(after, size)"]
+  }
+  list.concat(
+    list.concat(
+      [
+        "    " + emit.starts_with(prefix, "after") + " -> {",
+        "      let #(after, size) = " + scanner + "(after, " + int.to_string(
+          emit.bytes(prefix)
+        ) + ")"
+      ],
+      suffix
+    ),
+    [
+      "      let text = _slice(source, pos.byte_offset, size)",
+      "      _push(source, after, acc, token." + c.numbers.int_token + "(text), pos, _advance(pos, string.length(text), size))",
+      "    }"
+    ]
+  )
+}
+
+_number_arm(c: Config) -> List(String) {
+  let n = c.numbers
+  match n.int_enabled {
+    False -> []
+    True -> {
+      let scanning = match n.float_enabled {
+        True -> [
+          "      let #(after, size, is_float) = _scan_number(rest, 0)",
+          "      let text = _slice(source, pos.byte_offset, size)",
+          "      let found = match is_float {",
+          "        True -> token." + n.float_token + "(text)",
+          "        False -> token." + n.int_token + "(text)",
+          "      }"
+        ]
+        False -> list.concat(
+          ["      let #(after, size) = _scan_digits(rest, 0)"],
+          list.concat(
+            match n.suffixes {
+              [] -> []
+              _ -> [
+                "      let #(after, size) = _scan_number_suffix(after, size)"
+              ]
+            },
+            [
+              "      let text = _slice(source, pos.byte_offset, size)",
+              "      let found = token." + n.int_token + "(text)"
+            ]
+          )
+        )
+      }
+      list.concat(
+        list.concat(
+          [
+            "    // Numbers",
+            "    <<first:size(8), _:bits>> if first >= 48 && first <= 57 -> {"
+          ],
+          scanning
+        ),
+        [
+          "      _push(source, after, acc, found, pos, _advance(pos, string.length(text), size))",
+          "    }"
+        ]
+      )
+    }
+  }
+}
+
+_ident_arm(c: Config) -> List(String) {
+  match c.identifier.enabled {
+    False -> []
+    True -> {
+      let start = config.class_chars(c.identifier.start)
+      // Digits are claimed by the number arm above.
+      let start = match c.numbers.int_enabled {
+        True -> list.filter(start, fn(ch: String) { !name.is_digit(ch) })
+        False -> start
+      }
+      let columns = match c.identifier.unicode {
+        True -> "string.length(text)"
+        False -> "size"
+      }
+      [
+        "    // Identifiers and keywords",
+        "    <<first:size(8), _:bits>> if " + _guard(
+          "first",
+          start,
+          c.identifier.unicode
+        ) + " -> {",
+        "      let #(after, size) = _scan_ident(rest, 0)",
+        "      let text = _slice(source, pos.byte_offset, size)",
+        "      _push(source, after, acc, " + _ident_token(c) + ", pos, _advance(pos, " + columns + ", size))",
+        "    }"
+      ]
+    }
+  }
+}
+
+_ident_token(c: Config) -> String {
+  match #(c.keywords, c.literals) {
+    #([], []) -> "token." + c.identifier.token + "(text)"
+    _ -> "_keyword(text)"
+  }
+}
+
+// --- character guards -----------------------------------------------------------------------
+
+/// A guard testing one byte, `variable`, against a set of ASCII characters,
+/// with runs of codes as ranges: `(b >= 97 && b <= 122) || b == 95`. With
+/// `unicode`, any byte of a non-ASCII character is accepted too.
+_guard(variable: String, characters: List(String), unicode: Bool) -> String {
+  let codes = list.sort(list.unique(list.map(characters, name.code)))
+  let ranges = list.map(_runs(codes, []), fn(run: #(Int, Int)) {
+    match run.0 == run.1 {
+      True -> variable + " == " + int.to_string(run.0)
+      False -> "(" + variable + " >= " + int.to_string(run.0) + " && " + variable + " <= " + int.to_string(
+        run.1
+      ) + ")"
+    }
+  })
+  let parts = match unicode {
+    True -> list.append(ranges, variable + " >= 128")
+    False -> ranges
+  }
+  match parts {
+    [] -> "False"
+    _ -> string.join(parts, " || ")
+  }
+}
+
+/// Sorted codes as runs of consecutive codes.
+_runs(codes: List(Int), done: List(#(Int, Int))) -> List(#(Int, Int)) {
+  match #(codes, done) {
+    #([], _) -> list.reverse(done)
+    #([code, ..rest], [#(low, high), ..earlier]) if code == high + 1 -> _runs(
+      rest,
+      list.prepend(earlier, #(low, code))
+    )
+    #([code, ..rest], _) -> _runs(rest, list.prepend(done, #(code, code)))
+  }
+}
+
+_digit_guard(variable: String) -> String {
+  variable + " >= 48 && " + variable + " <= 57"
+}
+
+// --- keywords -----------------------------------------------------------------------------
+
+_keyword_fn(c: Config) -> List(String) {
+  match #(c.keywords, c.literals) {
+    #([], []) -> []
+    _ -> {
+      let words = list.sort(list.concat(c.keywords, c.literals))
+      list.concat(
+        [
+          "/// An identifier's token: a keyword or literal, or an identifier.",
+          "_keyword(text: String) -> Token {",
+          "  match text {"
+        ],
+        list.concat(
+          list.map(words, fn(w: String) {
+            "    " + emit.literal(w) + " -> token." + token.word_name(c, w) + "()"
+          }),
+          [
+            "    _ -> token." + c.identifier.token + "(text)",
+            "  }",
+            "}",
+            ""
+          ]
+        )
+      )
+    }
+  }
+}
+
+// --- scanners -----------------------------------------------------------------------------
+
+_scanners(c: Config) -> List(String) {
+  let n = c.numbers
+  let ident = match c.identifier.enabled {
+    True -> _class_scanner(
+      "_scan_ident",
+      _guard(
+        "next",
+        config.class_chars(c.identifier.more),
+        c.identifier.unicode
+      )
+    )
+    False -> []
+  }
+  let separator = match n.separator {
+    Some(sep) -> " || next == " + int.to_string(name.code(sep))
+    None -> ""
+  }
+  let digits = match n.int_enabled {
+    True -> _class_scanner("_scan_digits", _digit_guard("next") + separator)
+    False -> []
+  }
+  let prefixed = match n.int_enabled {
+    False -> []
+    True -> list.flat_map(
+      [
+        #(
+          n.hex_prefix,
+          "_scan_hex_digits",
+          "(next >= 48 && next <= 57) || (next >= 97 && next <= 102) || (next >= 65 && next <= 70)"
+        ),
+        #(n.binary_prefix, "_scan_binary_digits", "next == 48 || next == 49"),
+        #(n.octal_prefix, "_scan_octal_digits", "next >= 48 && next <= 55")
+      ],
+      fn(p: #(Option(String), String, String)) {
+        match p.0 {
+          Some(_) -> _class_scanner(p.1, p.2 + separator)
+          None -> []
+        }
+      }
+    )
+  }
+  let lines: List(Option(LineComment)) = [
+    c.comments.line,
+    c.comments.doc,
+    c.comments.module_doc
+  ]
+  let line = match list.any(lines, fn(l: Option(LineComment)) { l != None }) {
+    True -> _line_scanner()
+    False -> []
+  }
+  let block = match c.comments.block {
+    Some(b) -> _block_scanner(b)
+    None -> []
+  }
+  let strings = list.flat_map(c.strings, fn(s: StringStyle) {
+    _string_scanner(scanner_name(s), s.quote, s.escapes, s.multiline)
+  })
+  let chars = match c.chars {
+    Some(QuotedChars(quote, escapes, _)) -> _string_scanner(
+      "_scan_char",
+      quote,
+      escapes,
+      False
+    )
+    _ -> []
+  }
+  list.flat_map(
+    [
+      ident,
+      digits,
+      _number_scanner(c),
+      _exponent_scanner(c),
+      _suffix_scanner(c),
+      prefixed,
+      line,
+      block,
+      strings,
+      chars
+    ],
+    fn(part: List(String)) { part }
+  )
+}
+
+/// A scanner that takes bytes while `guard` (about `next`) holds.
+_class_scanner(function: String, guard: String) -> List(String) {
+  [
+    function + "(rest: BitArray, size: Int) -> #(BitArray, Int) {",
+    "  match rest {",
+    "    <<next:size(8), after:bits>> if " + guard + " -> " + function + "(after, size + 1)",
+    "    _ -> #(rest, size)",
+    "  }",
+    "}",
+    ""
+  ]
+}
+
+_number_scanner(c: Config) -> List(String) {
+  let n = c.numbers
+  match n.int_enabled && n.float_enabled {
+    False -> []
+    True -> {
+      let exponent = match n.exponent_markers {
+        [] -> []
+        _ -> ["      let #(rest, size) = _scan_exponent(rest, size)"]
+      }
+      let suffix = match n.suffixes {
+        [] -> []
+        _ -> ["      let #(rest, size) = _scan_number_suffix(rest, size)"]
+      }
+      let whole = match #(n.exponent_after_int, n.exponent_markers) {
+        #(True, [_, ..]) -> list.concat(
+          [
+            "    _ -> {",
+            "      let #(rest, with_exponent) = _scan_exponent(rest, size)",
+            "      let is_float = with_exponent != size",
+            "      let size = with_exponent"
+          ],
+          list.concat(suffix, ["      #(rest, size, is_float)", "    }"])
+        )
+        _ -> list.concat(
+          ["    _ -> {"],
+          list.concat(suffix, ["      #(rest, size, False)", "    }"])
+        )
+      }
+      let fraction = list.concat(
+        [
+          "    <<46, digit:size(8), after:bits>> if " + _digit_guard("digit") + " -> {",
+          "      let #(rest, size) = _scan_digits(after, size + 2)"
+        ],
+        list.concat(
+          exponent,
+          list.concat(suffix, ["      #(rest, size, True)", "    }"])
+        )
+      )
+      list.concat(
+        [
+          "/// Digits, then perhaps a fraction and an exponent. True for a float.",
+          "_scan_number(rest: BitArray, size: Int) -> #(BitArray, Int, Bool) {",
+          "  let #(rest, size) = _scan_digits(rest, size)",
+          "  match rest {"
+        ],
+        list.concat(fraction, list.concat(whole, ["  }", "}", ""]))
+      )
+    }
+  }
+}
+
+_exponent_scanner(c: Config) -> List(String) {
+  let n = c.numbers
+  match n.int_enabled && n.float_enabled && n.exponent_markers != [] {
+    False -> []
+    True -> {
+      let starts = list.flat_map(n.exponent_markers, fn(marker: String) {
+        list.map(["+", "-", ""], fn(sign: String) { #(marker + sign, Nil) })
+      })
+      let arms = list.map(emit.longest_first(starts), fn(pair: #(String, Nil)) {
+        "    <<" + emit.literal(pair.0) + ":utf8, digit:size(8), after:bits>> if " + _digit_guard(
+          "digit"
+        ) + " -> _scan_digits(after, size + " + int.to_string(
+          emit.bytes(pair.0) + 1
+        ) + ")"
+      })
+      list.concat(
+        [
+          "_scan_exponent(rest: BitArray, size: Int) -> #(BitArray, Int) {",
+          "  match rest {"
+        ],
+        list.concat(arms, ["    _ -> #(rest, size)", "  }", "}", ""])
+      )
+    }
+  }
+}
+
+_suffix_scanner(c: Config) -> List(String) {
+  match #(c.numbers.int_enabled, c.numbers.suffixes) {
+    #(True, [_, ..]) -> {
+      let arms = list.map(
+        emit.longest_first(list.map(c.numbers.suffixes, fn(s: String) {
+          #(s, Nil)
+        })),
+        fn(pair: #(String, Nil)) {
+          "    " + emit.starts_with(pair.0, "after") + " -> #(after, size + " + int.to_string(
+            emit.bytes(pair.0)
+          ) + ")"
+        }
+      )
+      list.concat(
+        [
+          "_scan_number_suffix(rest: BitArray, size: Int) -> #(BitArray, Int) {",
+          "  match rest {"
+        ],
+        list.concat(arms, ["    _ -> #(rest, size)", "  }", "}", ""])
+      )
+    }
+    _ -> []
+  }
+}
+
+_line_scanner() -> List(String) {
+  [
+    "/// Everything up to, but not including, the next line break.",
+    "_scan_line(rest: BitArray, size: Int) -> #(BitArray, Int) {",
+    "  match rest {",
+    "    <<10, _:bits>> | <<13, _:bits>> -> #(rest, size)",
+    "    <<_:size(8), after:bits>> -> _scan_line(after, size + 1)",
+    "    _ -> #(rest, size)",
+    "  }",
+    "}",
+    ""
+  ]
+}
+
+_block_scanner(block: BlockComment) -> List(String) {
+  let close = int.to_string(emit.bytes(block.finish))
+  let nested = match block.nested {
+    True -> [
+      "    " + emit.starts_with(block.start, "after") + " -> _scan_block_comment(after, size + " + int.to_string(
+        emit.bytes(block.start)
+      ) + ", depth + 1)"
+    ]
+    False -> []
+  }
+  list.concat(
+    [
+      "/// To the end of a block comment. False if it never ends.",
+      "_scan_block_comment(rest: BitArray, size: Int, depth: Int) -> #(BitArray, Int, Bool) {",
+      "  match rest {",
+      "    " + emit.starts_with(block.finish, "after") + " -> match depth {",
+      "      1 -> #(after, size + " + close + ", True)",
+      "      _ -> _scan_block_comment(after, size + " + close + ", depth - 1)",
+      "    }"
+    ],
+    list.concat(nested, [
+      "    <<_:size(8), after:bits>> -> _scan_block_comment(after, size + 1, depth)",
+      "    _ -> #(rest, size, False)",
+      "  }",
+      "}",
+      ""
+    ])
+  )
+}
+
+/// A scanner for quoted text. Returns what is left, the size including the
+/// delimiters, and whether the closing quote was found.
+_string_scanner(function: String, quote: String, escapes: Bool, multiline: Bool) -> List(
+  String
+) {
+  let escape = match escapes {
+    False -> []
+    True -> list.concat(
+      ["    <<92, after:bits>> -> match after {"],
+      list.concat(
+        match multiline {
+          True -> []
+          False -> [
+            "      <<10, _:bits>> | <<13, _:bits>> -> #(after, size + 1, False)"
+          ]
+        },
+        [
+          "      <<_:size(8), more:bits>> -> " + function + "(more, size + 2)",
+          "      _ -> #(after, size + 1, False)",
+          "    }"
+        ]
+      )
+    )
+  }
+  let breaks = match multiline {
+    True -> []
+    False -> ["    <<10, _:bits>> | <<13, _:bits>> -> #(rest, size, False)"]
+  }
+  list.concat(
+    [
+      function + "(rest: BitArray, size: Int) -> #(BitArray, Int, Bool) {",
+      "  match rest {",
+      "    " + emit.starts_with(quote, "after") + " -> #(after, size + " + int.to_string(
+        emit.bytes(quote)
+      ) + ", True)"
+    ],
+    list.concat(escape, list.concat(breaks, [
+      "    <<_:size(8), after:bits>> -> " + function + "(after, size + 1)",
+      "    _ -> #(rest, size, False)",
+      "  }",
+      "}",
+      ""
+    ]))
+  )
+}
+
+/// The scanner for a string style, such as `_scan_raw_string`.
+scanner_name(style: StringStyle) -> String {
+  "_scan_" + style.name + "_string"
+}
+
+_prefixed_char_fn(c: Config) -> List(String) {
+  match c.chars {
+    Some(PrefixedChars(prefix, escapes, t)) -> {
+      let open = int.to_string(emit.bytes(prefix))
+      let escaped = match escapes {
+        False -> []
+        True -> [
+          "    <<92, lead:size(8), _:bits>> -> {",
+          "      let size = " + open + " + 1 + _width(lead)",
+          "      let text = _slice(source, pos.byte_offset, size)",
+          "      _push(source, _drop(rest, 1 + _width(lead)), acc, token." + t + "(_inside(source, pos, size, " + open + ", 0)), pos, _advance_text(pos, text))",
+          "    }",
+          "    <<92>> -> _push(source, <<>>, acc, token." + c.error_token + "(" + emit.literal(
+            prefix + "\\"
+          ) + "), pos, _advance(pos, " + int.to_string(emit.columns(prefix) + 1) + ", " + open + " + 1))"
+        ]
+      }
+      list.concat(
+        [
+          "/// A character written with its prefix, such as `$a`.",
+          "_prefixed_char(source: String, rest: BitArray, pos: Position, acc: List(Lexeme)) -> List(Lexeme) {",
+          "  match rest {"
+        ],
+        list.concat(escaped, [
+          "    <<lead:size(8), _:bits>> -> {",
+          "      let size = " + open + " + _width(lead)",
+          "      let text = _slice(source, pos.byte_offset, size)",
+          "      _push(source, _drop(rest, _width(lead)), acc, token." + t + "(_inside(source, pos, size, " + open + ", 0)), pos, _advance_text(pos, text))",
+          "    }",
+          "    _ -> _push(source, rest, acc, token." + c.error_token + "(" + emit.literal(
+            prefix
+          ) + "), pos, _advance(pos, " + int.to_string(emit.columns(prefix)) + ", " + open + "))",
+          "  }",
+          "}",
+          ""
+        ])
+      )
+    }
+    _ -> []
+  }
+}
+
+// --- helpers --------------------------------------------------------------------------------
+
+/// The helpers the code calls, and the helpers they call, in a fixed order.
+_used_helpers(c: Config, body: String) -> List(#(String, List(String))) {
+  let all = _helpers(c)
+  let used = _expand(
+    list.filter_map(all, fn(h: #(String, List(String))) {
+      match string.contains(body, h.0 + "(") {
+        True -> Some(h.0)
+        False -> None
+      }
+    }),
+    all
+  )
+  list.filter(all, fn(h: #(String, List(String))) { list.contains(used, h.0) })
+}
+
+_expand(used: List(String), all: List(#(String, List(String)))) -> List(String) {
+  let next = list.unique(
+    list.concat(used, list.flat_map(all, fn(h: #(String, List(String))) {
+      match list.contains(used, h.0) {
+        True -> list.filter_map(all, fn(other: #(String, List(String))) {
+          match string.contains(emit.lines(h.1), other.0 + "(") {
+            True -> Some(other.0)
+            False -> None
+          }
+        })
+        False -> []
+      }
+    }))
+  )
+  match list.length(next) == list.length(used) {
+    True -> used
+    False -> _expand(next, all)
+  }
+}
+
+_helpers(c: Config) -> List(#(String, List(String))) {
+  [
+    #("_done", [
+      "_done(pos: Position, acc: List(Lexeme)) -> List(Lexeme) {",
+      "  list.reverse(list.prepend(acc, Lexeme(token.End(), Span(pos, pos))))",
+      "}",
+      ""
+    ]),
+    #("_push", [
+      "_push(source: String, rest: BitArray, acc: List(Lexeme), found: Token, start: Position, end: Position) -> List(Lexeme) {",
+      "  _loop(source, rest, end, list.prepend(acc, Lexeme(found, Span(start, end))))",
+      "}",
+      ""
+    ]),
+    #("_unexpected", [
+      "/// One character nothing else matched.",
+      "_unexpected(source: String, rest: BitArray, pos: Position, acc: List(Lexeme)) -> List(Lexeme) {",
+      "  match rest {",
+      "    <<lead:size(8), _:bits>> -> {",
+      "      let size = _width(lead)",
+      "      let text = _slice(source, pos.byte_offset, size)",
+      "      _push(source, _drop(rest, size), acc, token." + c.error_token + "(text), pos, _advance_text(pos, text))",
+      "    }",
+      "    _ -> _done(pos, acc)",
+      "  }",
+      "}",
+      ""
+    ]),
+    #("_advance", [
+      "_advance(pos: Position, columns: Int, bytes: Int) -> Position {",
+      "  Position(pos.line, pos.column + columns, pos.byte_offset + bytes)",
+      "}",
+      ""
+    ]),
+    #("_next_line", [
+      "_next_line(pos: Position, bytes: Int) -> Position {",
+      "  Position(pos.line + 1, 1, pos.byte_offset + bytes)",
+      "}",
+      ""
+    ]),
+    #("_advance_text", [
+      "/// Move past text that may hold line breaks.",
+      "_advance_text(pos: Position, text: String) -> Position {",
+      "  let bytes = string.byte_size(text)",
+      "  let flat = string.replace(string.replace(text, \"\\r\\n\", \"\\n\"), \"\\r\", \"\\n\")",
+      "  match string.split(flat, \"\\n\") {",
+      "    [only] -> _advance(pos, string.length(only), bytes)",
+      "    pieces -> {",
+      "      let last = match list.last(pieces) {",
+      "        Some(found) -> found",
+      "        None -> \"\"",
+      "      }",
+      "      Position(pos.line + list.length(pieces) - 1, string.length(last) + 1, pos.byte_offset + bytes)",
+      "    }",
+      "  }",
+      "}",
+      ""
+    ]),
+    #("_inside", [
+      "/// A token's text without its opening and closing delimiters.",
+      "_inside(source: String, pos: Position, size: Int, open: Int, close: Int) -> String {",
+      "  _slice(source, pos.byte_offset + open, size - open - close)",
+      "}",
+      ""
+    ]),
+    #("_slice", [
+      "/// Bytes of the source, as text.",
+      "_slice(source: String, from: Int, size: Int) -> String {",
+      "  match bit_array.slice(bit_array.from_string(source), from, size) {",
+      "    Ok(part) -> match bit_array.to_string(part) {",
+      "      Ok(text) -> text",
+      "      Error(_) -> \"\"",
+      "    }",
+      "    Error(_) -> \"\"",
+      "  }",
+      "}",
+      ""
+    ]),
+    #("_drop", [
+      "/// The input after its first `size` bytes.",
+      "_drop(rest: BitArray, size: Int) -> BitArray {",
+      "  match bit_array.slice(rest, size, bit_array.byte_size(rest) - size) {",
+      "    Ok(after) -> after",
+      "    Error(_) -> <<>>",
+      "  }",
+      "}",
+      ""
+    ]),
+    #("_width", [
+      "/// How many bytes a UTF-8 character takes, from its first byte.",
+      "_width(lead: Int) -> Int {",
+      "  match lead {",
+      "    _ if lead < 128 -> 1",
+      "    _ if lead < 224 -> 2",
+      "    _ if lead < 240 -> 3",
+      "    _ -> 4",
+      "  }",
+      "}",
+      ""
+    ])
+  ]
+}

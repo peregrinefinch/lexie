@@ -1,0 +1,398 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module lexie_test
+
+import poke/should
+import poke/regression
+
+import lexie
+import lexie/check
+import lexie/config.{Config, ConfigError}
+import lexie/name
+import pooka/list
+import pooka/string
+import tome
+
+_read(source: String) -> #(Config, List(ConfigError)) {
+  let doc = should.be_ok(tome.parse(source))
+  config.parse(doc)
+}
+
+/// Every problem, from reading and from checking.
+_errors(source: String) -> List(ConfigError) {
+  let #(c, problems) = _read(source)
+  list.concat(problems, check.validate(c))
+}
+
+// --- names ---------------------------------------------------------------------------
+
+test "words become PascalCase" {
+  should.equal(name.derive("if"), Ok("If"))
+  should.equal(name.derive("else"), Ok("Else"))
+  should.equal(name.derive("if2"), Ok("If2"))
+}
+
+test "symbols are spelled out" {
+  should.equal(name.derive("=="), Ok("EqualEqual"))
+  should.equal(name.derive("->"), Ok("MinusGreater"))
+  should.equal(name.derive("|>"), Ok("VBarGreater"))
+  should.equal(name.derive("#("), Ok("HashLeftParen"))
+  should.equal(name.derive(",@"), Ok("CommaAt"))
+}
+
+test "words and symbols mix" {
+  should.equal(name.derive("set-car!"), Ok("SetMinusCarBang"))
+  should.equal(name.derive("null?"), Ok("NullQuestion"))
+  should.equal(name.derive("_"), Ok("Underscore"))
+}
+
+test "some text has no name" {
+  should.equal(name.derive(""), Error("token text cannot be empty"))
+  let _ = should.be_error(name.derive("→"))
+}
+
+test "names given by hand win" {
+  should.equal(name.token_name("|>", [#("|>", "Pipe")], "Operator"), Ok("Pipe"))
+  should.equal(name.token_name("==", [#("|>", "Pipe")], "Operator"), Ok(
+    "EqualEqual"
+  ))
+  let _ = should.be_error(name.token_name("|>", [#("|>", "pipe")], "Operator"))
+}
+
+test "names Pooka reserves get their section" {
+  should.equal(name.token_name("true", [], "Literal"), Ok("TrueLiteral"))
+  should.equal(name.token_name("nil", [], "Literal"), Ok("NilLiteral"))
+  should.equal(name.token_name("int", [], "Keyword"), Ok("IntKeyword"))
+  should.equal(name.token_name("null", [], "Literal"), Ok("Null"))
+}
+
+test "valid class names" {
+  should.be_true(name.is_valid_class("Token"))
+  should.be_true(name.is_valid_class("A1"))
+  should.be_false(name.is_valid_class("lower"))
+  should.be_false(name.is_valid_class("With Space"))
+  should.be_false(name.is_valid_class(""))
+}
+
+test "valid module paths" {
+  should.be_true(name.is_valid_module("my_language/syntax"))
+  loop bad in [
+    "../outside",
+    "/absolute",
+    "bad-name",
+    "Upper",
+    "module//lexer",
+    "match",
+    "test"
+  ] {
+    should.equal_named(!name.is_valid_module(bad), True, bad)
+  }
+}
+
+// --- reading ---------------------------------------------------------------------------
+
+test "an empty specification uses the defaults" {
+  let #(c, problems) = _read("")
+  should.equal(problems, [])
+  should.equal(c.output_dir, "src")
+  should.equal(c.module_name, "")
+  should.be_true(c.identifier.enabled)
+  should.be_true(c.numbers.int_enabled)
+  should.be_true(c.numbers.float_enabled)
+  should.equal(c.strings, [])
+  should.equal(c.error_token, "Unexpected")
+}
+
+test "unknown sections and keys are reported" {
+  should.equal(
+    _one_error(_errors("[keyword]\nitems = []")).location,
+    "[keyword]"
+  )
+  should.equal(
+    _one_error(_errors(
+      "[keywords]\nitem = [\"if\"]"
+    )).location,
+    "[keywords]"
+  )
+  loop source in [
+    "[module]\nnaem = \"demo\"",
+    "[output]\ndirectory = \"src\"",
+    "[highlighter]\nenabld = true",
+    "[comments]\nregular = {}",
+    "[numbers]\ninteger = {}"
+  ] {
+    should.equal_named(_errors(source) != [], True, source)
+  }
+}
+
+test "wrong types are reported" {
+  should.equal(
+    _one_error(_errors(
+      "[whitespace]\nitems = 1"
+    )).location,
+    "whitespace.items"
+  )
+  loop source in [
+    "module = 1",
+    "comments = 1",
+    "numbers = 1",
+    "identifier = 1",
+    "strings = 1",
+    "tokens = 1"
+  ] {
+    should.equal_named(_errors(source) != [], True, source)
+  }
+}
+
+test "character classes" {
+  should.equal(config.parse_class("a-z"), config.Range("a", "z"))
+  should.equal(config.parse_class("_?!"), config.Set(["_", "?", "!"]))
+  should.equal(config.parse_class("-"), config.Set(["-"]))
+  should.equal(
+    config.class_chars([config.Range("a", "c"), config.Set(["_", "a"])]),
+    [
+      "a",
+      "b",
+      "c",
+      "_"
+    ]
+  )
+}
+
+// --- checks ----------------------------------------------------------------------------
+
+test "duplicates and conflicts" {
+  should.equal(
+    _one_error(_errors(
+      "[operators]\nitems = [\"+\", \"+\"]"
+    )).location,
+    "[operators]"
+  )
+  let where = _one_error(_errors(
+    "[operators]\nitems = [\"(\"]\n[punctuation]\nitems = [\"(\"]"
+  )).location
+  should.equal(where, "[operators] and [punctuation]")
+}
+
+test "keywords must be lexable as identifiers" {
+  should.equal(
+    _one_error(_errors(
+      "[keywords]\nitems = [\"if!\"]"
+    )).location,
+    "[keywords]"
+  )
+}
+
+test "word-like operators would swallow identifiers" {
+  should.equal(
+    _one_error(_errors(
+      "[operators]\nitems = [\"and\"]"
+    )).location,
+    "[operators]"
+  )
+}
+
+test "two tokens cannot share a class name" {
+  should.equal(
+    _one_error(_errors(
+      "[keywords]\nitems = [\"pipe\"]\n[operators]\nitems = [\"|>\"]\n[tokens.names]\n\"|>\" = \"Pipe\""
+    )).location,
+    "tokens"
+  )
+}
+
+test "floats need ints" {
+  should.equal(
+    _one_error(_errors(
+      "[numbers.int]\nenabled = false"
+    )).location,
+    "[numbers.float]"
+  )
+}
+
+test "empty or odd delimiters" {
+  should.not_equal(_errors("[chars]\nquote = \"\""), [])
+  should.not_equal(_errors("[chars]\nprefix = \"\""), [])
+  should.not_equal(
+    _errors("[comments.block]\nstart = \"/*\"\nend = \"/\"\nnested = true"),
+    []
+  )
+}
+
+test "numeric separators must be punctuation" {
+  loop separator in [".", "1", "e", "é", " ", "+", "-"] {
+    should.equal_named(
+      _errors("[numbers.int]\nseparator = \"" + separator + "\"") != [],
+      True,
+      separator
+    )
+  }
+  should.equal(_errors("[numbers.int]\nseparator = \"_\""), [])
+}
+
+test "duplicate exponent markers and prefixes" {
+  should.not_equal(_errors("[numbers.float]\nexponent = [\"e\", \"e\"]"), [])
+  should.not_equal(
+    _errors("[numbers.prefixes]\nhex = \"0x\"\nbinary = \"0x\""),
+    []
+  )
+}
+
+test "names the generated modules or Pooka reserve" {
+  should.not_equal(_errors("[errors]\ntoken = \"Lexeme\""), [])
+  should.not_equal(_errors("[numbers.int]\ntoken = \"Int\""), [])
+  should.not_equal(
+    _errors("[strings.double]\nquote = \"'\"\ntoken = \"String\""),
+    []
+  )
+}
+
+test "ranges must be ascending ASCII" {
+  should.not_equal(_errors("[identifier]\nstart = [\"z-a\"]"), [])
+  should.not_equal(_errors("[identifier]\ncontinue = [\"a-🦊\"]"), [])
+}
+
+test "invalid module paths are refused by generate" {
+  let c = config.default_config()
+  let bad = config.Config(
+    "bad-name",
+    c.output_dir,
+    c.highlighter,
+    c.whitespace,
+    c.keywords,
+    c.literals,
+    c.operators,
+    c.punctuation,
+    c.names,
+    c.identifier,
+    c.comments,
+    c.strings,
+    c.chars,
+    c.numbers,
+    c.error_token,
+    c.location_info
+  )
+  let _ = should.be_error(lexie.generate(bad))
+}
+
+// --- generating --------------------------------------------------------------------------
+
+test "generate is pure, and makes the three modules" {
+  let files = should.be_ok(lexie.generate(config.default_config()))
+  should.equal(list.map(files, fn(f: lexie.GeneratedFile) { f.path }), [
+    "src/location.pooka",
+    "src/token.pooka",
+    "src/lexer.pooka"
+  ])
+  should.be_true(list.all(files, fn(f: lexie.GeneratedFile) {
+    lexie.is_generated(f.content)
+  }))
+}
+
+test "a highlighter, in a module folder, when asked" {
+  let #(c, []) = _read(
+    "[module]\nname = \"lang/syntax\"\n[highlighter]\nenabled = true"
+  )
+  let files = should.be_ok(lexie.generate(c))
+  should.equal(list.map(files, fn(f: lexie.GeneratedFile) { f.path }), [
+    "src/lang/syntax/location.pooka",
+    "src/lang/syntax/token.pooka",
+    "src/lang/syntax/lexer.pooka",
+    "src/lang/syntax/highlighter.pooka"
+  ])
+  let lexer_file = should.be_some(list.find(files, fn(f: lexie.GeneratedFile) {
+    string.ends_with(f.path, "lexer.pooka")
+  }))
+  should.be_true(string.contains(
+    lexer_file.content,
+    "import lang/syntax/token.{Lexeme, Token}"
+  ))
+}
+
+test "only lexie's own files count as generated" {
+  should.be_true(lexie.is_generated(
+    "//// Code generated by lexie. DO NOT EDIT.\nmodule lexer\n"
+  ))
+  should.be_false(lexie.is_generated("module lexer\n"))
+  should.be_false(lexie.is_generated(
+    "// Code generated by lexie. DO NOT EDIT. (not the first line)"
+  ))
+}
+
+test "standalone specification text carries configuration errors separately" {
+  let #(c, problems) = should.be_ok(
+    lexie.read("[keywords]\nitems = [\"let\"]\n")
+  )
+  should.equal(problems, [])
+  should.equal(c.keywords, ["let"])
+  should.be_error(lexie.read("not = [valid TOML"))
+}
+
+// --- the documentation's own examples ----------------------------------------------------
+
+test "the defaults the documentation describes" {
+  let defaults = config.default_config()
+  should.equal(defaults.output_dir, "src")
+  should.equal(defaults.identifier.token, "Ident")
+  should.equal(defaults.numbers.int_token, "IntLiteral")
+  should.equal(check.validate(defaults), [])
+}
+
+test "the guide's table of names" {
+  regression.check(
+    [
+      regression.Case("a word", "if", Ok("If")),
+      regression.Case("an underscore between words", "else_if", Ok("ElseIf")),
+      regression.Case("two equals", "==", Ok("EqualEqual")),
+      regression.Case("an arrow", "->", Ok("MinusGreater")),
+      regression.Case("a tuple opening", "#(", Ok("HashLeftParen")),
+      regression.Case("Lisp punctuation", "set-car!", Ok("SetMinusCarBang"))
+    ],
+    name.derive
+  )
+  should.equal(name.token_name("int", [], "Keyword"), Ok("IntKeyword"))
+}
+
+// Check the public diagnostic shape once, so each regression names the field
+// it cares about without hiding the complete list when the count is wrong.
+_one_error(problems: List(ConfigError)) -> ConfigError {
+  should.equal(list.length(problems), 1)
+  should.be_some(list.first(problems))
+}
+
+test "an underscore joins words, and is spelled out anywhere else" {
+  should.equal(name.derive("else_if"), Ok("ElseIf"))
+  should.equal(name.derive("a_b_c"), Ok("ABC"))
+  should.equal(name.derive("is_ok?"), Ok("IsOkQuestion"))
+  should.equal(name.derive("_"), Ok("Underscore"))
+  should.equal(name.derive("_x"), Ok("UnderscoreX"))
+  should.equal(name.derive("x_"), Ok("XUnderscore"))
+  should.equal(name.derive("a__b"), Ok("AUnderscoreUnderscoreB"))
+}
+
+test "location-info is typed and defaults to located lexemes" {
+  let #(defaults, []) = _read("")
+  should.be_true(defaults.location_info)
+  let #(plain, []) = _read("location-info = false")
+  should.be_false(plain.location_info)
+  let #(_, errors) = _read("location-info = \"yes\"")
+  should.equal(list.length(errors), 1)
+  should.equal(should.be_some(list.first(errors)).location, "location-info")
+}
+
+test "source output subdirectories are included in generated imports" {
+  let #(specification, []) = _read(
+    "[output]\ndir = \"src/generated\"\n[module]\nname = \"language/scanner\""
+  )
+  let files = lexie.generate(specification) |> should.be_ok()
+  let lexer = list.find(files, fn(file) {
+    string.ends_with(file.path, "/lexer.pooka")
+  }) |> should.be_some()
+  should.equal(lexer.path, "src/generated/language/scanner/lexer.pooka")
+  should.contain_text(lexer.content, "import generated/language/scanner/token")
+}
+
+test "source directories must form valid module paths" {
+  should.equal(_errors("[output]\ndir = \"src/generated\""), [])
+  should.not_equal(_errors("[output]\ndir = \"src/not-a-module\""), [])
+}

@@ -1,0 +1,96 @@
+//// The words of your language, as a family of classes.
+////
+//// Generates `token.pooka`: the `Token` family, one class per token, and
+//// `Lexeme`, a token with its span.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module generate_token
+
+import lexie/config.{Config}
+import lexie/emit
+import lexie/token.{TokenDef}
+import pooka/list
+
+/// The source of `token.pooka` for a specification.
+source(c: Config) -> String {
+  let classes = _with_headings(
+    list.map(token.definitions(c), fn(d: TokenDef) {
+      #(section(d.kind), _class(d))
+    }),
+    "",
+    []
+  )
+  emit.lines(
+    list.concat(
+      [
+        emit.header("The token types produced by the generated lexer."),
+        "module token",
+        "",
+        "import " + emit.module_path(c, "location") + ".{Span}",
+        "",
+        "/// One token.",
+        "class Token {}"
+      ],
+      list.concat(classes, [
+        "",
+        "/// A token, with the span of source it was lexed from.",
+        "class Lexeme(token: Token, span: Span)",
+        ""
+      ])
+    )
+  )
+}
+
+_class(d: TokenDef) -> String {
+  match d.payload {
+    True -> "class " + d.name + "(text: String) is Token"
+    False -> "class " + d.name + " is Token {}"
+  }
+}
+
+/// The heading a token appears under.
+section(kind: token.Kind) -> String {
+  match kind {
+    token.Keyword(_) -> "Keywords"
+    token.Literal(_) -> "Literals"
+    token.Operator(_) -> "Operators"
+    token.Punctuation(_) -> "Punctuation"
+    token.IdentKind -> "Identifiers"
+    token.IntKind | token.FloatKind -> "Numbers"
+    token.StringKind -> "Strings"
+    token.CharKind -> "Characters"
+    token.CommentKind | token.DocCommentKind | token.ModuleCommentKind | token.BlockCommentKind -> "Comments"
+    token.WhitespaceKind -> "Whitespace"
+    token.ErrorKind | token.EndKind -> "Control"
+  }
+}
+
+/// Lines, with a comment heading before each new section.
+_with_headings(
+  items: List(#(String, String)),
+  current: String,
+  done: List(String)
+) -> List(String) {
+  match items {
+    [] -> list.reverse(done)
+    [#(heading, line), ..rest] -> match heading == current {
+      True -> _with_headings(
+        rest,
+        current,
+        list.prepend(list.prepend(done, ""), line)
+      )
+      False -> _with_headings(
+        rest,
+        heading,
+        list.prepend(
+          list.prepend(
+            list.prepend(list.prepend(done, ""), "// " + heading),
+            ""
+          ),
+          line
+        )
+      )
+    }
+  }
+}

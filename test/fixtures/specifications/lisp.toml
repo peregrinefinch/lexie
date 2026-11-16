@@ -1,0 +1,14 @@
+[module]
+name = "lisp"
+[identifier]
+start = ["a-z", "A-Z", "_+-*/=<>!?"]
+continue = ["a-z", "A-Z", "0-9", "_+-*/=<>!?"]
+token = "Symbol"
+[punctuation]
+items = ["(", ")", "'"]
+[comments.line]
+start = ";"
+emit = false
+[strings.double]
+quote = "\""
+escapes = true

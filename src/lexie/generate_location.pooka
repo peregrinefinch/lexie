@@ -1,0 +1,41 @@
+//// Where things are: lines, columns, and how far into the bytes.
+////
+//// Generates `location.pooka`: positions and spans.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module generate_location
+
+import lexie/emit
+
+/// The source of `location.pooka`. It does not depend on the specification.
+source() -> String {
+  emit.lines([
+    emit.header("Source positions and half-open spans for the generated lexer."),
+    "module location",
+    "",
+    "import pooka/int",
+    "",
+    "/// Lines and columns are one-based; columns count characters. The offset is",
+    "/// zero-based and counts UTF-8 bytes.",
+    "class Position(line: Int, column: Int, byte_offset: Int) {",
+    "  format() -> String { int.to_string(line) + \":\" + int.to_string(column) }",
+    "}",
+    "",
+    "/// From `start`, up to but not including `end`.",
+    "class Span(start: Position, end: Position) {",
+    "  byte_length() -> Int { end.byte_offset - start.byte_offset }",
+    "}",
+    "",
+    "/// Attach a source path when a diagnostic crosses a file boundary.",
+    "class Location(path: String, span: Span) {",
+    "  format() -> String { path + \":\" + span.start.format() }",
+    "}",
+    "",
+    "/// The start of the source.",
+    "start() -> Position {",
+    "  Position(1, 1, 0)",
+    "}",
+    ""
+  ])
+}

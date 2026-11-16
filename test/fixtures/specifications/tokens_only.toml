@@ -1,0 +1,16 @@
+location-info = false
+
+[module]
+name = "bare"
+
+[highlighter]
+enabled = true
+
+[keywords]
+items = ["let"]
+
+[operators]
+items = ["="]
+
+[identifier]
+unicode = true
