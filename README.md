@@ -1,6 +1,6 @@
-<p align="center">
+<div align="center">
   <img src="assets/lexie.png" alt="Lexie holding up the letter tiles of her name" width="280" />
-</p>
+</div>
 
 # lexie
 
