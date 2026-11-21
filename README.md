@@ -12,7 +12,7 @@ Generate Pooka lexers, source spans and syntax highlighters from TOML.
 
 ```sh
 pooka add lexie --dev
-pooka add poke --dev
+pooka add poke --dev --git https://github.com/peregrinefinch/poke.git --rev 91ef891395ed3308d820bfa22e3b2dba4c39ecc5
 pooka run -m lexie init
 pooka run -m lexie
 ```

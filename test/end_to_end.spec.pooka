@@ -72,15 +72,17 @@ _project(here: String, directory: String) -> String {
   let manifest_path = path.join([project, "pooka.toml"])
   let manifest = should.be_ok(file.read(manifest_path))
   should.contain_text(manifest, "[dev-dependencies]")
-  should.be_ok(
-    file.write(
-      manifest_path,
-      string.replace(
-        manifest,
-        "[dev-dependencies]",
-        "[dev-dependencies]\npoke = \">= 1.0.0 and < 2.0.0\""
-      )
-    )
+  let _ = _pooka(
+    [
+      "add",
+      "poke",
+      "--dev",
+      "--git",
+      "https://github.com/peregrinefinch/poke.git",
+      "--rev",
+      "91ef891395ed3308d820bfa22e3b2dba4c39ecc5"
+    ],
+    project
   )
   should.be_ok(file.delete(path.join([project, "test", "main.spec.pooka"])))
   project
