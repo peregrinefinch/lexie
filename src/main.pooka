@@ -72,7 +72,7 @@ _usage() -> String {
 }
 
 _version() -> String {
-  "1.0.0"
+  "1.1.0"
 }
 
 _command(arguments: List(String)) -> Result(String, String) {

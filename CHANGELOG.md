@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0
+
+- Run the generated lexer tests with Poke and Pooka stdlib 0.4.1.
+
 ## 1.0.0
 
 - Initial release of `lexie`.

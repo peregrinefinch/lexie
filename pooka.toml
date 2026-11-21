@@ -1,5 +1,5 @@
 name = "lexie"
-version = "1.0.0"
+version = "1.1.0"
 description = "Generate Pooka lexers, source spans and syntax highlighters from TOML"
 authors = ["Peregrine Finch"]
 licences = ["Apache-2.0"]
